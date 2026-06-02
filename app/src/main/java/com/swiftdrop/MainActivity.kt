@@ -8,11 +8,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -33,6 +36,17 @@ class MainActivity : AppCompatActivity() {
 
     private val askNotify =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val askCamera =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) launchScanner()
+        }
+
+    private val scanQR =
+        registerForActivityResult(ScanContract()) { result ->
+            val contents = result.contents ?: return@registerForActivityResult
+            Thread { handleQRResult(contents) }.start()
+        }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,6 +140,70 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun launchScanner() {
+        val opts = ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt("Scan the QR code shown on the other device")
+            setBeepEnabled(false)
+            setOrientationLocked(true)
+            setCameraId(0)
+        }
+        scanQR.launch(opts)
+    }
+
+    private fun handleQRResult(contents: String) {
+        try {
+            val obj = JSONObject(contents)
+            val host = obj.getString("host")
+            val peerId = obj.getString("id")
+            val token = obj.getString("token")
+
+            // POST to the remote device's /api/pair/qr-claim
+            val payload = JSONObject().apply {
+                put("token", token)
+                put("id", State.deviceId)
+                put("name", State.deviceName)
+            }.toString()
+
+            val conn = (java.net.URL("http://$host/api/pair/qr-claim").openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"; connectTimeout = 5000; readTimeout = 5000
+                setRequestProperty("Content-Type", "application/json")
+                doOutput = true
+            }
+            conn.outputStream.use { it.write(payload.toByteArray()) }
+
+            if (conn.responseCode != 200) {
+                val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "pairing rejected"
+                conn.disconnect()
+                runOnUiThread { jsCallback(false, err) }
+                return
+            }
+
+            val result = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            conn.disconnect()
+            val keyHex = result.optString("key")
+            val keyBytes = ByteArray(keyHex.length / 2) { i ->
+                ((Character.digit(keyHex[2 * i], 16) shl 4) + Character.digit(keyHex[2 * i + 1], 16)).toByte()
+            }
+            if (keyBytes.size != 32) {
+                runOnUiThread { jsCallback(false, "invalid key from peer") }
+                return
+            }
+            PairStore.storeKey(peerId, keyBytes)
+            Log.i("SwiftDrop", "QR paired with $peerId")
+            runOnUiThread { jsCallback(true, null) }
+        } catch (e: Exception) {
+            Log.e("SwiftDrop", "QR pair failed", e)
+            runOnUiThread { jsCallback(false, e.message ?: "QR pairing failed") }
+        }
+    }
+
+    private fun jsCallback(ok: Boolean, err: String?) {
+        val js = if (ok) "window.onQRPairResult && window.onQRPairResult(true)"
+        else "window.onQRPairResult && window.onQRPairResult(false, ${JSONObject.quote(err ?: "error")})"
+        web.evaluateJavascript(js, null)
+    }
+
     inner class Bridge {
         @JavascriptInterface
         fun pickFiles() {
@@ -143,6 +221,17 @@ class MainActivity : AppCompatActivity() {
                 try {
                     startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS))
                 } catch (_: Exception) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun scanQRCode() {
+            runOnUiThread {
+                if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                    launchScanner()
+                } else {
+                    askCamera.launch(Manifest.permission.CAMERA)
+                }
             }
         }
     }

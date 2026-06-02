@@ -162,7 +162,8 @@
     </div>
     <div id="pairStep1" class="pair-step">
       <p style="margin:0 0 14px;color:var(--muted);font-size:14px">Pair with <b id="pairDevName"></b>:</p>
-      <button class="pair-option" id="pairQR">Show QR Code</button>
+      <button class="pair-option" id="pairScanQR">Scan QR Code</button>
+      <button class="pair-option ghost" id="pairQR">Show QR Code</button>
       <div class="qr-or">— or use PIN —</div>
       <button class="pair-option" id="pairGenerate">Generate PIN on this device</button>
       <button class="pair-option ghost" id="pairEnter">I have a PIN from the other device</button>
@@ -492,6 +493,24 @@ async function pairSubmitPin() {
 
 function startPairing(deviceId, deviceName) { openPairModal(deviceId, deviceName); }
 
+function pairScanQR() {
+  if (window.AndroidBridge && AndroidBridge.scanQRCode) {
+    closePairModal();
+    AndroidBridge.scanQRCode();
+  } else {
+    toast("QR scanning is only available on Android", true);
+  }
+}
+
+window.onQRPairResult = function(ok, err) {
+  if (ok) {
+    toast("Paired via QR code!");
+    refreshPairedStatus();
+  } else {
+    toast(err || "QR pairing failed", true);
+  }
+};
+
 async function unpairDevice(id) {
   try {
     await apiFetch("/api/pair/unpair?id=" + encodeURIComponent(id), { method: "POST" });
@@ -505,6 +524,7 @@ async function unpairDevice(id) {
 // Pairing modal wiring
 $("#pairClose").addEventListener("click", closePairModal);
 $("#pairModal").addEventListener("click", e => { if (e.target === $("#pairModal")) closePairModal(); });
+$("#pairScanQR").addEventListener("click", pairScanQR);
 $("#pairQR").addEventListener("click", pairShowQR);
 $("#pairGenerate").addEventListener("click", pairGenerate);
 $("#pairEnter").addEventListener("click", pairShowInput);
