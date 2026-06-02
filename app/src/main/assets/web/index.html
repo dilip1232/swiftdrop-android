@@ -115,6 +115,9 @@
   .pin-input { flex: 1; font-family: monospace; font-size: 22px; letter-spacing: 8px; text-align: center; padding: 14px; border-radius: 13px; border: 1.5px solid var(--border); background: var(--panel-2); color: var(--text); outline: none; -webkit-appearance: none; }
   .pin-input:focus { border-color: var(--accent); }
   .pair-submit { flex: none; padding: 14px 20px; }
+  .qr-container { text-align: center; padding: 10px 0; }
+  .qr-container img { border-radius: 12px; background: #fff; padding: 10px; max-width: 220px; }
+  .qr-or { color: var(--muted); font-size: 12px; margin: 12px 0 8px; text-align: center; }
 </style>
 </head>
 <body>
@@ -159,8 +162,15 @@
     </div>
     <div id="pairStep1" class="pair-step">
       <p style="margin:0 0 14px;color:var(--muted);font-size:14px">Pair with <b id="pairDevName"></b>:</p>
+      <button class="pair-option" id="pairQR">Show QR Code</button>
+      <div class="qr-or">— or use PIN —</div>
       <button class="pair-option" id="pairGenerate">Generate PIN on this device</button>
       <button class="pair-option ghost" id="pairEnter">I have a PIN from the other device</button>
+    </div>
+    <div id="pairStepQR" class="pair-step" style="display:none">
+      <p style="margin:0 0 10px;color:var(--muted);font-size:14px">Scan this QR code with the other device:</p>
+      <div class="qr-container"><img id="qrImage" src="" alt="QR Code"></div>
+      <p style="margin:10px 0 0;color:var(--muted);font-size:12px">Expires in 120 seconds</p>
     </div>
     <div id="pairStep2" class="pair-step" style="display:none">
       <p style="margin:0 0 10px;color:var(--muted);font-size:14px">Share this PIN with the other device:</p>
@@ -406,6 +416,7 @@ function openPairModal(deviceId, deviceName) {
   pairTargetName = deviceName;
   $("#pairDevName").textContent = deviceName;
   $("#pairStep1").style.display = "";
+  $("#pairStepQR").style.display = "none";
   $("#pairStep2").style.display = "none";
   $("#pairStep3").style.display = "none";
   $("#pairError").style.display = "none";
@@ -434,6 +445,28 @@ async function pairGenerate() {
       } catch {}
     }, 2000);
   } catch { toast("Failed to start pairing", true); closePairModal(); }
+}
+
+async function pairShowQR() {
+  try {
+    const r = await (await apiFetch("/api/pair/qr-begin", { method: "POST" })).json();
+    // Android returns qr_png as a plain base64 string.
+    $("#qrImage").src = "data:image/png;base64," + r.qr_png;
+    $("#pairStep1").style.display = "none";
+    $("#pairStepQR").style.display = "";
+    clearInterval(pairPollTimer);
+    pairPollTimer = setInterval(async () => {
+      try {
+        const s = await (await apiFetch("/api/pair/status?id=" + encodeURIComponent(pairTargetId))).json();
+        if (s.paired) {
+          clearInterval(pairPollTimer); pairPollTimer = null;
+          toast(`Paired with ${pairTargetName}!`);
+          closePairModal();
+          refreshPairedStatus();
+        }
+      } catch {}
+    }, 2000);
+  } catch { toast("Failed to generate QR code", true); closePairModal(); }
 }
 
 function pairShowInput() {
@@ -472,6 +505,7 @@ async function unpairDevice(id) {
 // Pairing modal wiring
 $("#pairClose").addEventListener("click", closePairModal);
 $("#pairModal").addEventListener("click", e => { if (e.target === $("#pairModal")) closePairModal(); });
+$("#pairQR").addEventListener("click", pairShowQR);
 $("#pairGenerate").addEventListener("click", pairGenerate);
 $("#pairEnter").addEventListener("click", pairShowInput);
 $("#pinSubmit").addEventListener("click", pairSubmitPin);

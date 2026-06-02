@@ -4,3 +4,5 @@
 }
 # NanoHTTPD
 -keep class fi.iki.elonen.** { *; }
+# ZXing QR code generation
+-keep class com.google.zxing.** { *; }

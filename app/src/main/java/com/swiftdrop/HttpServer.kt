@@ -4,9 +4,14 @@ import android.content.ContentValues
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.graphics.Bitmap
+import android.util.Base64
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import fi.iki.elonen.NanoHTTPD
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 
 /**
  * The peer-facing + UI HTTP server. Mirrors the Mac app's contract:
@@ -58,6 +63,9 @@ class HttpServer : NanoHTTPD(State.PORT) {
                 json("""{"ok":true}""")
             }
             uri == "/api/pair/claim" && session.method == Method.POST -> handlePairClaim(session)
+            // QR-based pairing
+            uri == "/api/pair/qr-begin" -> withToken(session) { handleQRBegin() }
+            uri == "/api/pair/qr-claim" && session.method == Method.POST -> handleQRClaim(session)
             uri == "/" || uri == "/index.html" -> asset("web/index.html", "text/html")
             else -> asset("web$uri", mimeFor(uri))
         }
@@ -375,6 +383,40 @@ class HttpServer : NanoHTTPD(State.PORT) {
         }
         PairStore.storeKey(deviceId, keyBytes)
         return json("""{"ok":true}""")
+    }
+
+    private fun handleQRBegin(): Response {
+        val token = PairStore.generateQRToken()
+        val ip = State.localIp()
+        val host = "$ip:${State.PORT}"
+        val payload = JSONObject().apply {
+            put("host", host); put("id", State.deviceId); put("token", token)
+        }.toString()
+        // Generate QR code PNG.
+        val writer = QRCodeWriter()
+        val matrix = writer.encode(payload, BarcodeFormat.QR_CODE, 256, 256)
+        val w = matrix.width; val h = matrix.height
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+        for (x in 0 until w) for (y in 0 until h)
+            bmp.setPixel(x, y, if (matrix.get(x, y)) 0xFF000000.toInt() else 0xFFFFFFFF.toInt())
+        val baos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
+        val pngB64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+        return json(JSONObject().apply {
+            put("qr_png", pngB64); put("token", token); put("payload", payload)
+        }.toString())
+    }
+
+    private fun handleQRClaim(session: IHTTPSession): Response {
+        val body = HashMap<String, String>()
+        session.parseBody(body)
+        val obj = JSONObject(body["postData"] ?: "{}")
+        val token = obj.optString("token")
+        val peerId = obj.optString("id")
+        val key = PairStore.claimQRToken(token, peerId)
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "invalid or expired token")
+        return json("""{"key":"${PairStore.bytesToHex(key)}"}"""
+        )
     }
 
     private fun handlePairClaim(session: IHTTPSession): Response {

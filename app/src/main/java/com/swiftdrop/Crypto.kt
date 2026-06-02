@@ -108,13 +108,18 @@ object PairStore {
     private const val PREFS = "swiftdrop_pairs"
     private val keys = mutableMapOf<String, ByteArray>()
 
-    // Pending pairing offer
+    // Pending PIN pairing offer
     @Volatile var pendingPIN: String? = null
         private set
     @Volatile var pendingKey: ByteArray? = null
         private set
     @Volatile var pendingExpiry: Long = 0
         private set
+
+    // Pending QR pairing offer
+    @Volatile private var qrToken: String? = null
+    @Volatile private var qrKey: ByteArray? = null
+    @Volatile private var qrExpiry: Long = 0
 
     fun init(ctx: Context) {
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -147,6 +152,29 @@ object PairStore {
             keys[peerId] = key
             pendingPIN = null
             pendingKey = null
+            save()
+            return key
+        }
+    }
+
+    fun generateQRToken(): String {
+        val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val tok = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        synchronized(keys) {
+            qrToken = bytesToHex(tok)
+            qrKey = key
+            qrExpiry = System.currentTimeMillis() + 120_000
+        }
+        return qrToken!!
+    }
+
+    fun claimQRToken(token: String, peerId: String): ByteArray? {
+        synchronized(keys) {
+            if (qrToken == null || token != qrToken || System.currentTimeMillis() > qrExpiry) return null
+            val key = qrKey!!
+            keys[peerId] = key
+            qrToken = null
+            qrKey = null
             save()
             return key
         }
