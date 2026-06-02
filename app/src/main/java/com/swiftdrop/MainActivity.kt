@@ -88,6 +88,11 @@ class MainActivity : AppCompatActivity() {
         handleShareIntent(intent)
     }
 
+    override fun onDestroy() {
+        SwiftDropService.stop(this)
+        super.onDestroy()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)

@@ -22,6 +22,10 @@ class Transfer(val id: String, val name: String, val size: Long, val peer: Strin
     @Volatile var status: String = "sending" // "sending" | "done" | "error" | "canceled"
     @Volatile var err: String? = null
     @Volatile var canceled: Boolean = false  // set by /api/transfers/cancel
+    @Volatile var conn: java.net.HttpURLConnection? = null  // for forced disconnect on cancel
+    // For retry: stored only for outbound sends
+    @Volatile var uri: String? = null
+    @Volatile var peerId: String? = null
 }
 
 /**

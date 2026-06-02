@@ -38,6 +38,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
             uri == "/api/transfers" -> withToken(session) { json(transfersJson()) }
             uri == "/api/transfers/clear" -> withToken(session) { clearFinished(); json("""{"ok":true}""") }
             uri == "/api/transfers/cancel" -> withToken(session) { cancelTransfer(session); json("""{"ok":true}""") }
+            uri == "/api/transfers/retry" && session.method == Method.POST -> withToken(session) { retryTransfer(session) }
             uri == "/api/send-path" && session.method == Method.POST -> withToken(session) { handleSend(session) }
             uri == "/api/peers/add" && session.method == Method.POST -> handleAddPeer(session) // public — peers announce themselves
             uri == "/api/peers/remove" && session.method == Method.POST -> withToken(session) { handleRemovePeer(session) }
@@ -290,7 +291,26 @@ class HttpServer : NanoHTTPD(State.PORT) {
         State.transfers.firstOrNull { it.id == id && it.status == "sending" }?.let {
             it.canceled = true
             it.status = "canceled"
+            // Force-disconnect the HTTP connection to abort the transfer immediately
+            Thread { runCatching { it.conn?.disconnect() } }.start()
         }
+    }
+
+    private fun retryTransfer(session: IHTTPSession): Response {
+        val id = session.parameters["id"]?.firstOrNull()
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "id required")
+        val old = State.transfers.firstOrNull { it.id == id && (it.status == "error" || it.status == "canceled") && it.dir == "send" }
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "transfer not found or not retryable")
+        val uriStr = old.uri
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "no URI stored")
+        val peerId = old.peerId
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "no peer stored")
+        val peer = State.peer(peerId)
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "peer no longer available")
+        State.transfers.remove(old)
+        val uri = Uri.parse(uriStr)
+        Thread { Sender.sendUri(peer, uri) }.start()
+        return json("""{"ok":true}""")
     }
 
     private fun transfersJson(): String {
@@ -300,6 +320,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
                 put("id", t.id); put("name", t.name); put("size", t.size)
                 put("sent", t.sent.get()); put("status", t.status); put("peer", t.peer); put("dir", t.dir)
                 t.err?.let { put("err", it) }
+                if (t.dir == "send" && (t.status == "error" || t.status == "canceled") && t.uri != null) put("retryable", true)
             })
         }
         return arr.toString()

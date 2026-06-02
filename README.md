@@ -9,18 +9,22 @@ No Android Studio required — build and install entirely from the terminal.
 
 ## Features
 
-- **Device pairing** — PIN-based pairing before any file transfer; paired keys are persisted
+- **AES-256-GCM encryption** — all transfers between paired devices are encrypted end-to-end
+- **Device pairing** — PIN-based and QR code pairing; paired keys are persisted across restarts
+- **QR scanner with autofocus** — continuous autofocus and metering for fast QR scanning
 - **Bilateral unpairing** — unpairing on one device notifies the other
 - **Auto-close pairing dialog** — when the remote device confirms the PIN, the local dialog closes automatically
 - **SHA-256 integrity verification** — sender hashes the file, receiver verifies after write; corrupted files are rejected and deleted
-- **Dynamic notifications** — status bar icon changes based on transfer state (sending/receiving/idle)
-- **Live transfer progress** — real-time progress bars and speed display
+- **Smart notifications** — idle notification shows device name and IP; active transfers show progress (percentage, data transferred, speed); completion notification fires when done
+- **Live transfer progress** — real-time progress bars with transferred data (MB/GB), percentage, and speed
+- **Retry failed transfers** — retry button on failed/canceled outbound sends
 - **Open folder** — tap the folder icon next to a completed transfer to open Downloads
-- **Cancel transfers** — cancel an in-flight send; disconnects the connection immediately
+- **Cancel transfers** — cancel an in-flight send (including encrypted); connection is disconnected immediately
 - **Share sheet integration** — share files into SwiftDrop from any app
 - **Wake + WiFi locks** — CPU and WiFi radio stay active during transfers, even with screen off
 - **Stall detection** — 30s read timeout detects dead peers
 - **No file size cap** — transfers of any size; disk space checked before writing
+- **Automatic version bumping** — CI sets versionName and versionCode from git tag on release
 
 ## What it does
 
@@ -104,9 +108,16 @@ Tap the device name in the header to rename this device.
 Shares the exact HTTP contract with the Mac app, so Mac ↔ Android works both
 directions.
 
+## Shared Core
+
+The transfer engine, discovery, encryption, and HTTP API contract are shared with
+the macOS and Windows apps via
+[swiftdrop-core](https://github.com/dilip1232/swiftdrop-core). The Android app
+re-implements the same HTTP contract in Kotlin (NanoHTTPD) for native Android
+integration (MediaStore, foreground service, SAF).
+
 ## Roadmap
 
 - Battery optimization exemption prompt on first launch
-- Windows companion app
 - Optional self-signed TLS with cached fingerprint
 - Resume interrupted transfers via HTTP range

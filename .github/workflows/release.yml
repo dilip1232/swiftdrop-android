@@ -37,6 +37,17 @@ jobs:
             -keypass "${{ secrets.KEYSTORE_PASSWORD || 'swiftdrop123' }}" \
             -dname "CN=SwiftDrop, OU=Dev, O=SwiftDrop, L=Unknown, ST=Unknown, C=US"
 
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          CODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          sed -i "s/versionCode = .*/versionCode = $CODE/" app/build.gradle.kts
+          sed -i "s/versionName = .*/versionName = \"$VERSION\"/" app/build.gradle.kts
+          echo "Set versionName=$VERSION versionCode=$CODE"
+
       - name: Build release APK
         run: |
           chmod +x gradlew

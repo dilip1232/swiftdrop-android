@@ -56,7 +56,10 @@ object Sender {
         val key = PairStore.isPaired(peer.id)
         val encrypted = key != null
 
-        val t = State.newTransfer(name, if (size < 0) 0 else size, peer.name, "send")
+        val t = State.newTransfer(name, if (size < 0) 0 else size, peer.name, "send").also {
+            it.uri = uri.toString()
+            it.peerId = peer.id
+        }
         Notifier.refreshServiceNotification()
         PowerLocks.begin()
         var conn: HttpURLConnection? = null
@@ -76,6 +79,7 @@ object Sender {
                 readTimeout = 0 // no timeout for large encrypted writes
                 if (wireSize >= 0) setFixedLengthStreamingMode(wireSize) else setChunkedStreamingMode(BUF)
             }
+            t.conn = conn
 
             cr.openInputStream(uri).use { input ->
                 requireNotNull(input) { "cannot open file" }
@@ -110,22 +114,25 @@ object Sender {
             if (t.canceled) t.status = "canceled"
             else { t.status = "error"; t.err = e.message }
         } finally {
+            t.conn = null
             Notifier.refreshServiceNotification()
             PowerLocks.end()
         }
     }
 
-    /** InputStream wrapper that updates a Transfer's sent counter as bytes are read. */
+    /** InputStream wrapper that updates a Transfer's sent counter and checks for cancellation. */
     private class CountingInputStream(
         private val inner: InputStream,
         private val transfer: Transfer
     ) : InputStream() {
         override fun read(): Int {
+            if (transfer.canceled) throw java.io.IOException("canceled")
             val b = inner.read()
             if (b >= 0) transfer.sent.incrementAndGet()
             return b
         }
         override fun read(buf: ByteArray, off: Int, len: Int): Int {
+            if (transfer.canceled) throw java.io.IOException("canceled")
             val n = inner.read(buf, off, len)
             if (n > 0) transfer.sent.addAndGet(n.toLong())
             return n

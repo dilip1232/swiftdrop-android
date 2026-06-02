@@ -64,7 +64,7 @@ class SwiftDropService : Service() {
         runCatching { connectivity?.registerDefaultNetworkCallback(netCallback!!) }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
 
     override fun onDestroy() {
         runCatching { netCallback?.let { connectivity?.unregisterNetworkCallback(it) } }
@@ -84,6 +84,10 @@ class SwiftDropService : Service() {
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, SwiftDropService::class.java))
+        }
+
+        fun stop(ctx: Context) {
+            ctx.stopService(Intent(ctx, SwiftDropService::class.java))
         }
     }
 }
