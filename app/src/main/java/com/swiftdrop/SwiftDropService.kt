@@ -18,6 +18,7 @@ class SwiftDropService : Service() {
     private var server: HttpServer? = null
     private var discovery: Discovery? = null
     private var keepalive: Keepalive? = null
+    private var lanScanner: LANScanner? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var connectivity: ConnectivityManager? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
@@ -42,6 +43,7 @@ class SwiftDropService : Service() {
         }
         discovery = Discovery(this).also { it.start() }
         keepalive = Keepalive().also { it.start() }
+        lanScanner = LANScanner().also { it.start() }
 
         // Restart discovery on network change so devices/IPs refresh (and stale
         // peers from the old network are dropped).
@@ -52,7 +54,9 @@ class SwiftDropService : Service() {
                     Log.i("SwiftDrop", "network changed; restarting discovery")
                     State.clearMDNS()
                     runCatching { discovery?.stop() }
+                    runCatching { lanScanner?.stop() }
                     discovery = Discovery(this@SwiftDropService).also { it.start() }
+                    lanScanner = LANScanner().also { it.start() }
                 }
                 currentNetwork = network
             }
@@ -67,6 +71,7 @@ class SwiftDropService : Service() {
         runCatching { server?.stop() }
         runCatching { discovery?.stop() }
         runCatching { keepalive?.stop() }
+        runCatching { lanScanner?.stop() }
         runCatching { multicastLock?.release() }
         super.onDestroy()
     }

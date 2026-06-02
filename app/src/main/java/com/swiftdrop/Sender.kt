@@ -3,17 +3,34 @@ package com.swiftdrop
 import android.net.Uri
 import android.provider.OpenableColumns
 import java.io.BufferedOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.security.MessageDigest
 
 /**
  * Streams a file (given as a content URI) straight to a peer's /inbox using a
  * fixed-length HTTP body — no buffering of the whole file, so large transfers
  * run at full LAN speed. Progress is reported through the [Transfer].
+ *
+ * When the peer is paired, the stream is encrypted with AES-256-GCM (integrity
+ * comes from GCM, so no separate SHA-256 hash is needed).
  */
 object Sender {
     private const val BUF = 256 * 1024
+    private const val CHUNK_PLAIN = 256 * 1024
+    private const val NONCE_SIZE = 12
+    private const val TAG_OVERHEAD = 16
+
+    /** Compute the on-wire size of an encrypted stream, matching Go's EncryptedSize(). */
+    private fun encryptedSize(plain: Long): Long {
+        if (plain <= 0) return -1
+        val nChunks = (plain + CHUNK_PLAIN - 1) / CHUNK_PLAIN
+        // nonce + (4-byte len header + ciphertext per chunk) + 4-byte end marker
+        return NONCE_SIZE + nChunks * (4 + CHUNK_PLAIN + TAG_OVERHEAD) -
+                // last chunk may be shorter
+                (nChunks * CHUNK_PLAIN - plain) + 4
+    }
 
     fun sendUri(peer: Peer, uri: Uri) {
         val cr = State.appContext.contentResolver
@@ -36,11 +53,16 @@ object Sender {
             name = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "file"
         }
 
+        val key = PairStore.isPaired(peer.id)
+        val encrypted = key != null
+
         val t = State.newTransfer(name, if (size < 0) 0 else size, peer.name, "send")
         Notifier.refreshServiceNotification()
         PowerLocks.begin()
         var conn: HttpURLConnection? = null
         try {
+            val wireSize = if (encrypted) encryptedSize(size) else size
+
             conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
@@ -49,35 +71,31 @@ object Sender {
                 setRequestProperty("X-From", State.deviceName)
                 setRequestProperty("X-From-ID", State.deviceId)
                 if (size > 0) setRequestProperty("X-File-Size", size.toString())
-                // Compute SHA-256 hash for integrity verification.
-                val hash = cr.openInputStream(uri)?.use { hashInput ->
-                    val md = MessageDigest.getInstance("SHA-256")
-                    val hbuf = ByteArray(BUF)
-                    while (true) {
-                        val n = hashInput.read(hbuf)
-                        if (n < 0) break
-                        md.update(hbuf, 0, n)
-                    }
-                    md.digest().joinToString("") { "%02x".format(it) }
-                }
-                if (hash != null) setRequestProperty("X-SHA256", hash)
+                if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm")
                 connectTimeout = 8000
-                readTimeout = 30_000 // detect stalled peers
-                if (size >= 0) setFixedLengthStreamingMode(size) else setChunkedStreamingMode(BUF)
+                readTimeout = 0 // no timeout for large encrypted writes
+                if (wireSize >= 0) setFixedLengthStreamingMode(wireSize) else setChunkedStreamingMode(BUF)
             }
 
             cr.openInputStream(uri).use { input ->
                 requireNotNull(input) { "cannot open file" }
-                BufferedOutputStream(conn.outputStream, BUF).use { out ->
-                    val buf = ByteArray(BUF)
-                    while (true) {
-                        if (t.canceled) { conn.disconnect(); return }
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        t.sent.addAndGet(n.toLong())
+                if (encrypted) {
+                    // Wrap input with a counting stream for progress.
+                    val counting = CountingInputStream(input, t)
+                    Crypto.encryptStream(conn.outputStream, counting, key!!)
+                    conn.outputStream.flush()
+                } else {
+                    BufferedOutputStream(conn.outputStream, BUF).use { out ->
+                        val buf = ByteArray(BUF)
+                        while (true) {
+                            if (t.canceled) { conn.disconnect(); return }
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            t.sent.addAndGet(n.toLong())
+                        }
+                        out.flush()
                     }
-                    out.flush()
                 }
             }
 
@@ -95,5 +113,23 @@ object Sender {
             Notifier.refreshServiceNotification()
             PowerLocks.end()
         }
+    }
+
+    /** InputStream wrapper that updates a Transfer's sent counter as bytes are read. */
+    private class CountingInputStream(
+        private val inner: InputStream,
+        private val transfer: Transfer
+    ) : InputStream() {
+        override fun read(): Int {
+            val b = inner.read()
+            if (b >= 0) transfer.sent.incrementAndGet()
+            return b
+        }
+        override fun read(buf: ByteArray, off: Int, len: Int): Int {
+            val n = inner.read(buf, off, len)
+            if (n > 0) transfer.sent.addAndGet(n.toLong())
+            return n
+        }
+        override fun close() = inner.close()
     }
 }

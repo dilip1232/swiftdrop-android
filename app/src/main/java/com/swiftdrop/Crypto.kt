@@ -20,10 +20,10 @@ import javax.crypto.spec.SecretKeySpec
  *   [4-byte big-endian ciphertext-chunk length][ciphertext] …
  *   [4-byte 0x00000000] ← end marker
  *
- * Each chunk: up to 64 KiB plaintext, encrypted with nonce = baseNonce XOR chunkIndex.
+ * Each chunk: up to 256 KiB plaintext, encrypted with nonce = baseNonce XOR chunkIndex.
  */
 object Crypto {
-    private const val CHUNK_PLAIN = 64 * 1024
+    private const val CHUNK_PLAIN = 256 * 1024
     private const val NONCE_SIZE = 12
     private const val TAG_BITS = 128
 
@@ -59,7 +59,7 @@ object Crypto {
             readExact(inp, lenBuf)
             val cLen = ByteBuffer.wrap(lenBuf).int
             if (cLen == 0) break // end marker
-            if (cLen > CHUNK_PLAIN + 16 + 1024) throw IllegalStateException("chunk too large: $cLen")
+            if (cLen > CHUNK_PLAIN + 16 + 256) throw IllegalStateException("chunk too large: $cLen")
 
             val ct = ByteArray(cLen)
             readExact(inp, ct)

@@ -142,7 +142,13 @@ class HttpServer : NanoHTTPD(State.PORT) {
                 if (encrypted) {
                     val key = PairStore.isPaired(senderId)
                         ?: throw IllegalStateException("not paired with sender")
-                    Crypto.decryptStream(out, input, key)
+                    // Wrap output to track decrypted bytes for progress.
+                    val counting = object : java.io.OutputStream() {
+                        override fun write(b: Int) { out.write(b); tr.sent.incrementAndGet() }
+                        override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); tr.sent.addAndGet(len.toLong()) }
+                        override fun flush() = out.flush()
+                    }
+                    Crypto.decryptStream(counting, input, key)
                 } else {
                     val buf = ByteArray(256 * 1024)
                     var remaining = if (len >= 0) len else Long.MAX_VALUE
