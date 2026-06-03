@@ -44,6 +44,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
             uri == "/api/transfers/accept" -> withToken(session) { handleAcceptReject(session, true) }
             uri == "/api/transfers/reject" -> withToken(session) { handleAcceptReject(session, false) }
             uri == "/api/send-path" && session.method == Method.POST -> withToken(session) { handleSend(session) }
+            uri == "/transfer-signal" && session.method == Method.POST -> handleTransferSignal(session)
             uri == "/api/peers/add" && session.method == Method.POST -> handleAddPeer(session) // public — peers announce themselves
             uri == "/api/peers/remove" && session.method == Method.POST -> withToken(session) { handleRemovePeer(session) }
             // Pairing
@@ -357,6 +358,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val t = State.transfers.firstOrNull { it.id == id && it.status == "sending" }
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not sending")
         t.pause()
+        t.peerId?.let { pid -> Thread { notifyPeerSignal(pid, t.name, "pause") }.start() }
         return json("""{"ok":true}""")
     }
 
@@ -365,7 +367,45 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val t = State.transfers.firstOrNull { it.id == id && it.status == "paused" }
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not paused")
         t.resume()
+        t.peerId?.let { pid -> Thread { notifyPeerSignal(pid, t.name, "resume") }.start() }
         return json("""{"ok":true}""")
+    }
+
+    private fun handleTransferSignal(session: IHTTPSession): Response {
+        val map = HashMap<String, String>()
+        session.parseBody(map)
+        val body = JSONObject(map["postData"] ?: "{}")
+        val file = body.optString("file", "")
+        val action = body.optString("action", "")
+        val peerName = session.headers["x-from-name"] ?: ""
+        if (file.isEmpty() || action.isEmpty() || peerName.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "bad request")
+        // Find the matching recv transfer and update its status.
+        for (t in State.transfers) {
+            if (t.dir != "recv" || t.name != file || t.peer != peerName) continue
+            when (action) {
+                "pause" -> if (t.status == "sending") t.status = "paused"
+                "resume" -> if (t.status == "paused") t.status = "sending"
+            }
+            break
+        }
+        return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "ok")
+    }
+
+    private fun notifyPeerSignal(peerId: String, fileName: String, action: String) {
+        val peer = State.peer(peerId) ?: return
+        try {
+            val url = java.net.URL("http://${peer.host}/transfer-signal")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 3000; conn.readTimeout = 3000
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("X-From-Name", State.deviceName)
+            conn.doOutput = true
+            conn.outputStream.use { it.write("""{"file":"$fileName","action":"$action"}""".toByteArray()) }
+            conn.responseCode // trigger the request
+            conn.disconnect()
+        } catch (_: Exception) { /* best-effort */ }
     }
 
     private fun transfersJson(): String {

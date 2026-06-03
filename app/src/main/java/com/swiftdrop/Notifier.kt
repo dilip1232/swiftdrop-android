@@ -34,6 +34,17 @@ object Notifier {
         )
     }
 
+    /** PendingIntent that opens the main activity when a notification is tapped. */
+    private fun launchIntent(ctx: Context): android.app.PendingIntent {
+        val intent = android.content.Intent(ctx, MainActivity::class.java).apply {
+            flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return android.app.PendingIntent.getActivity(
+            ctx, 0, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
     /** Build the foreground service notification reflecting current transfer state. */
     fun serviceNotification(ctx: Context): Notification {
         val active = State.transfers.filter { it.status == "sending" }
@@ -43,6 +54,7 @@ object Notifier {
         val builder = Notification.Builder(ctx, SERVICE_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
             .setOngoing(true)
+            .setContentIntent(launchIntent(ctx))
 
         if (active.isEmpty()) {
             val ip = State.localIp()
@@ -141,6 +153,7 @@ object Notifier {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
+            .setContentIntent(launchIntent(ctx))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(alertId++, n)
     }
@@ -151,6 +164,7 @@ object Notifier {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
+            .setContentIntent(launchIntent(ctx))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(alertId++, n)
     }
