@@ -25,6 +25,11 @@ No Android Studio required — build and install entirely from the terminal.
 - **Stall detection** — 30s read timeout detects dead peers
 - **No file size cap** — transfers of any size; disk space checked before writing
 - **Automatic version bumping** — CI sets versionName and versionCode from git tag on release
+- **Per-device chat** — chat with individual paired devices; SVG icons, animated panel, unread indicator
+- **Receiver consent** — custom dark-themed accept/reject dialog before incoming transfers are written
+- **Pause/resume transfers** — pause and resume in-flight transfers; remote peer sees paused state
+- **HMAC authentication** — incoming transfers are verified with HMAC signatures
+- **EncryptedSharedPreferences** — paired keys stored securely via Android Keystore
 
 ## What it does
 
