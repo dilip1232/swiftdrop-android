@@ -122,6 +122,7 @@ object PairStore {
         private set
     @Volatile var pendingExpiry: Long = 0
         private set
+    @Volatile private var pendingFails: Int = 0
 
     // Pending QR pairing offer
     @Volatile private var qrToken: String? = null
@@ -148,17 +149,28 @@ object PairStore {
             pendingPIN = pin
             pendingKey = key
             pendingExpiry = System.currentTimeMillis() + 60_000
+            pendingFails = 0
         }
         return pin
     }
 
     fun claimPIN(pin: String, peerId: String): ByteArray? {
         synchronized(keys) {
-            if (pendingPIN == null || pin != pendingPIN || System.currentTimeMillis() > pendingExpiry) return null
+            if (pendingPIN == null || System.currentTimeMillis() > pendingExpiry) return null
+            if (pin != pendingPIN) {
+                pendingFails++
+                if (pendingFails >= 3) {
+                    // Invalidate PIN after 3 failed attempts to prevent brute-force.
+                    pendingPIN = null
+                    pendingKey = null
+                }
+                return null
+            }
             val key = pendingKey!!
             keys[peerId] = key
             pendingPIN = null
             pendingKey = null
+            pendingFails = 0
             save()
             return key
         }

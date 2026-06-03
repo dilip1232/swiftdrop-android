@@ -270,7 +270,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
 
     private fun devicesJson(): String {
         val arr = JSONArray()
-        for (p in State.peers.values) {
+        for (p in State.allPeers()) {
             arr.put(JSONObject().apply {
                 put("id", p.id); put("name", p.name)
                 put("platform", p.platform); put("host", p.host); put("manual", p.manual)
@@ -353,8 +353,14 @@ class HttpServer : NanoHTTPD(State.PORT) {
     }
 
     private fun safeName(raw: String): String {
-        val base = raw.substringAfterLast('/').substringAfterLast('\\')
-        return if (base.isBlank() || base == "." || base == "..") "received-file" else base
+        // First pass: strip path separators.
+        var name = raw.substringAfterLast('/').substringAfterLast('\\')
+        // Second pass: URL-decode then strip again to block %2F / %5C traversal.
+        try {
+            val decoded = java.net.URLDecoder.decode(name, "UTF-8")
+            name = decoded.substringAfterLast('/').substringAfterLast('\\')
+        } catch (_: Exception) { /* keep as-is if decode fails */ }
+        return if (name.isBlank() || name == "." || name == "..") "received-file" else name
     }
 
     // ---- pairing -----------------------------------------------------------
