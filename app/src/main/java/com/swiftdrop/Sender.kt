@@ -86,8 +86,9 @@ object Sender {
                 if (encrypted) {
                     // Wrap input with a counting stream for progress.
                     val counting = CountingInputStream(input, t)
-                    Crypto.encryptStream(conn.outputStream, counting, key!!)
-                    conn.outputStream.flush()
+                    val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
+                    Crypto.encryptStream(bufferedOut, counting, key!!)
+                    bufferedOut.flush()
                 } else {
                     BufferedOutputStream(conn.outputStream, BUF).use { out ->
                         val buf = ByteArray(BUF)

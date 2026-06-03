@@ -135,47 +135,44 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val encrypted = session.headers["x-encrypted"] == "aes-gcm"
         val senderId = session.headers["x-from-id"] ?: ""
 
+        // Hash on-the-fly so we never re-read the file from disk.
+        val md = java.security.MessageDigest.getInstance("SHA-256")
         try {
-            cr.openOutputStream(dest).use { out ->
-                requireNotNull(out) { "cannot open output" }
+            cr.openOutputStream(dest).use { rawOut ->
+                requireNotNull(rawOut) { "cannot open output" }
                 val input = session.inputStream
 
                 if (encrypted) {
                     val key = PairStore.isPaired(senderId)
                         ?: throw IllegalStateException("not paired with sender")
-                    // Wrap output to track decrypted bytes for progress.
+                    // BufferedOutputStream + counting + hashing wrapper.
+                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
                     val counting = object : java.io.OutputStream() {
-                        override fun write(b: Int) { out.write(b); tr.sent.incrementAndGet() }
-                        override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); tr.sent.addAndGet(len.toLong()) }
-                        override fun flush() = out.flush()
+                        override fun write(b: Int) { buffered.write(b); md.update(b.toByte()); tr.sent.incrementAndGet() }
+                        override fun write(b: ByteArray, off: Int, len: Int) { buffered.write(b, off, len); md.update(b, off, len); tr.sent.addAndGet(len.toLong()) }
+                        override fun flush() = buffered.flush()
                     }
                     Crypto.decryptStream(counting, input, key)
+                    buffered.flush()
                 } else {
+                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
                     val buf = ByteArray(256 * 1024)
                     var remaining = if (len >= 0) len else Long.MAX_VALUE
                     while (remaining > 0) {
                         val want = if (len >= 0) minOf(buf.size.toLong(), remaining).toInt() else buf.size
                         val n = input.read(buf, 0, want)
                         if (n < 0) break
-                        out.write(buf, 0, n)
+                        buffered.write(buf, 0, n)
+                        md.update(buf, 0, n)
                         remaining -= n
                         tr.sent.addAndGet(n.toLong())
                     }
+                    buffered.flush()
                 }
-                out.flush()
             }
-            // Verify SHA-256 integrity if the sender included a hash.
+            // Verify SHA-256 integrity if the sender included a hash (hashed on-the-fly above).
             val expected = session.headers["x-sha256"]
             if (!expected.isNullOrBlank()) {
-                val md = java.security.MessageDigest.getInstance("SHA-256")
-                cr.openInputStream(dest)?.use { verifyInput ->
-                    val vbuf = ByteArray(256 * 1024)
-                    while (true) {
-                        val n = verifyInput.read(vbuf)
-                        if (n < 0) break
-                        md.update(vbuf, 0, n)
-                    }
-                }
                 val actual = md.digest().joinToString("") { "%02x".format(it) }
                 if (actual != expected) {
                     runCatching { cr.delete(dest, null, null) }

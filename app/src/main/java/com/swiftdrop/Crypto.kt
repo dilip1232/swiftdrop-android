@@ -32,20 +32,25 @@ object Crypto {
         out.write(baseNonce)
 
         val buf = ByteArray(CHUNK_PLAIN)
+        val lenBuf = ByteBuffer.allocate(4)
+        val secretKey = SecretKeySpec(key, "AES")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val nonce = baseNonce.copyOf()
         var idx = 0L
         while (true) {
             val n = readFull(inp, buf)
             if (n <= 0) break
-            val nonce = chunkNonce(baseNonce, idx)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_BITS, nonce))
+            chunkNonceInPlace(nonce, baseNonce, idx)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(TAG_BITS, nonce))
             val ct = cipher.doFinal(buf, 0, n)
-            out.write(ByteBuffer.allocate(4).putInt(ct.size).array())
+            lenBuf.clear(); lenBuf.putInt(ct.size)
+            out.write(lenBuf.array())
             out.write(ct)
             idx++
         }
         // End marker
-        out.write(ByteBuffer.allocate(4).putInt(0).array())
+        lenBuf.clear(); lenBuf.putInt(0)
+        out.write(lenBuf.array())
         out.flush()
     }
 
@@ -53,32 +58,34 @@ object Crypto {
         val baseNonce = ByteArray(NONCE_SIZE)
         readExact(inp, baseNonce)
 
+        val lenBuf = ByteArray(4)
+        val secretKey = SecretKeySpec(key, "AES")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val nonce = baseNonce.copyOf()
+        val ctBuf = ByteArray(CHUNK_PLAIN + 16 + 256)
         var idx = 0L
         while (true) {
-            val lenBuf = ByteArray(4)
             readExact(inp, lenBuf)
             val cLen = ByteBuffer.wrap(lenBuf).int
             if (cLen == 0) break // end marker
-            if (cLen > CHUNK_PLAIN + 16 + 256) throw IllegalStateException("chunk too large: $cLen")
+            if (cLen > ctBuf.size) throw IllegalStateException("chunk too large: $cLen")
 
-            val ct = ByteArray(cLen)
-            readExact(inp, ct)
-            val nonce = chunkNonce(baseNonce, idx)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_BITS, nonce))
-            val pt = cipher.doFinal(ct)
+            readExact(inp, ctBuf, cLen)
+            chunkNonceInPlace(nonce, baseNonce, idx)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_BITS, nonce))
+            val pt = cipher.doFinal(ctBuf, 0, cLen)
             out.write(pt)
             idx++
         }
         out.flush()
     }
 
-    private fun chunkNonce(base: ByteArray, idx: Long): ByteArray {
-        val n = base.copyOf()
+    /** Mutate nonce in-place: copy base then XOR counter into low 8 bytes. */
+    private fun chunkNonceInPlace(dst: ByteArray, base: ByteArray, idx: Long) {
+        base.copyInto(dst)
         for (i in 0 until 8) {
-            n[n.size - 1 - i] = (n[n.size - 1 - i].toInt() xor ((idx shr (i * 8)) and 0xFF).toInt()).toByte()
+            dst[dst.size - 1 - i] = (base[base.size - 1 - i].toInt() xor ((idx shr (i * 8)) and 0xFF).toInt()).toByte()
         }
-        return n
     }
 
     private fun readFull(inp: InputStream, buf: ByteArray): Int {
@@ -91,10 +98,10 @@ object Crypto {
         return off
     }
 
-    private fun readExact(inp: InputStream, buf: ByteArray) {
+    private fun readExact(inp: InputStream, buf: ByteArray, len: Int = buf.size) {
         var off = 0
-        while (off < buf.size) {
-            val n = inp.read(buf, off, buf.size - off)
+        while (off < len) {
+            val n = inp.read(buf, off, len - off)
             if (n < 0) throw IllegalStateException("unexpected EOF")
             off += n
         }
