@@ -34,6 +34,17 @@ object Notifier {
         )
     }
 
+    /** PendingIntent that opens the main activity when a notification is tapped. */
+    private fun launchIntent(ctx: Context): android.app.PendingIntent {
+        val intent = android.content.Intent(ctx, MainActivity::class.java).apply {
+            flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return android.app.PendingIntent.getActivity(
+            ctx, 0, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
     /** Build the foreground service notification reflecting current transfer state. */
     fun serviceNotification(ctx: Context): Notification {
         val active = State.transfers.filter { it.status == "sending" }
@@ -43,6 +54,7 @@ object Notifier {
         val builder = Notification.Builder(ctx, SERVICE_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
             .setOngoing(true)
+            .setContentIntent(launchIntent(ctx))
 
         if (active.isEmpty()) {
             val ip = State.localIp()
@@ -141,6 +153,7 @@ object Notifier {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
+            .setContentIntent(launchIntent(ctx))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(alertId++, n)
     }
@@ -151,8 +164,41 @@ object Notifier {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
+            .setContentIntent(launchIntent(ctx))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(alertId++, n)
+    }
+
+    /** Show a consent notification with Accept / Reject action buttons. */
+    fun showConsentNotification(ctx: Context, transferId: String, from: String, fileName: String, size: String): Int {
+        val notifId = alertId++
+        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+
+        val acceptIntent = android.content.Intent(ctx, TransferConsentReceiver::class.java).apply {
+            action = TransferConsentReceiver.ACTION_ACCEPT
+            putExtra(TransferConsentReceiver.EXTRA_TRANSFER_ID, transferId)
+            putExtra(TransferConsentReceiver.EXTRA_NOTIF_ID, notifId)
+        }
+        val acceptPI = android.app.PendingIntent.getBroadcast(ctx, notifId * 2, acceptIntent, flags)
+
+        val rejectIntent = android.content.Intent(ctx, TransferConsentReceiver::class.java).apply {
+            action = TransferConsentReceiver.ACTION_REJECT
+            putExtra(TransferConsentReceiver.EXTRA_TRANSFER_ID, transferId)
+            putExtra(TransferConsentReceiver.EXTRA_NOTIF_ID, notifId)
+        }
+        val rejectPI = android.app.PendingIntent.getBroadcast(ctx, notifId * 2 + 1, rejectIntent, flags)
+
+        val n = Notification.Builder(ctx, ALERT_CHANNEL)
+            .setContentTitle("Incoming file from $from")
+            .setContentText("$fileName ($size)")
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setAutoCancel(false)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, "Accept", acceptPI).build())
+            .addAction(Notification.Action.Builder(null, "Reject", rejectPI).build())
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(notifId, n)
+        return notifId
     }
 
     private fun humanSize(bytes: Long): String {

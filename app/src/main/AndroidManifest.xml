@@ -51,5 +51,9 @@
             android:name=".SwiftDropService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".TransferConsentReceiver"
+            android:exported="false" />
     </application>
 </manifest>

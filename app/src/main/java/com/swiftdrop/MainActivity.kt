@@ -88,7 +88,18 @@ class MainActivity : AppCompatActivity() {
         handleShareIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        State.foregroundActivity = this
+    }
+
+    override fun onPause() {
+        if (State.foregroundActivity === this) State.foregroundActivity = null
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        if (State.foregroundActivity === this) State.foregroundActivity = null
         SwiftDropService.stop(this)
         super.onDestroy()
     }

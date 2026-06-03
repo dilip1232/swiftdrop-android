@@ -83,6 +83,8 @@
   .file .cancel:active { color: var(--err); }
   .file .retry { color: var(--accent); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; white-space: nowrap; }
   .file .retry:active { background: var(--accent); color: #fff; }
+  .file .pause { color: var(--muted); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  .file .pause:active { border-color: var(--muted); color: var(--text); }
   .file .openfolder { color: var(--muted); font-size: 15px; padding: 4px 6px; cursor: pointer; opacity: .5; text-decoration: none; }
   .file .openfolder:active { color: var(--accent); opacity: 1; }
   .ip { color: var(--muted); }
@@ -121,6 +123,7 @@
   .qr-container img { border-radius: 12px; background: #fff; padding: 10px; max-width: 220px; }
   .qr-or { color: var(--muted); font-size: 12px; margin: 12px 0 8px; text-align: center; }
 </style>
+<link rel="stylesheet" href="chat.css">
 </head>
 <body>
 <div class="wrap">
@@ -151,6 +154,23 @@
   <div class="actions">
     <button id="sendBtn" disabled>Send</button>
     <button class="ghost" id="clearBtn">Clear</button>
+  </div>
+
+  <div class="chat-panel" id="chatPanel">
+    <div class="chat-hdr">
+      <div class="chat-hdr-left">
+        <div class="chat-hdr-icon"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+        <span class="chat-hdr-name" id="chatName"></span>
+      </div>
+      <span class="chat-hdr-close" id="chatClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>
+    </div>
+    <div class="chat-msgs" id="chatMsgs">
+      <div class="chat-empty"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>No messages yet</div>
+    </div>
+    <div class="chat-input">
+      <textarea id="chatInput" placeholder="Type a message…" rows="1"></textarea>
+      <button class="chat-send" id="chatSendBtn" disabled><svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -252,9 +272,12 @@ function renderDevices() {
     const paired = state.pairedIds && state.pairedIds.has(d.id);
     row.innerHTML = `<div class="ic">${platformIcon(d.platform)}</div>
       <div style="flex:1;min-width:0"><div class="nm">${esc(d.name)}</div><div class="pf">${sub}</div></div>
+      ${paired ? '<span class="chat-btn" title="Chat"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="unread"></span></span>' : ''}
       ${paired ? '<button class="pair-btn paired">Paired</button>' : '<button class="pair-btn">Pair</button>'}
       <div class="rm" title="Remove">×</div>`;
     row.onclick = () => { state.target = d.id; renderDevices(); updateSend(); };
+    const chatBtn = row.querySelector(".chat-btn");
+    if (chatBtn) chatBtn.onclick = e => { e.stopPropagation(); openChat(d.id, d.name); };
     const pairBtn = row.querySelector(".pair-btn");
     if (pairBtn) pairBtn.onclick = e => { e.stopPropagation(); paired ? unpairDevice(d.id) : startPairing(d.id, d.name); };
     row.querySelector(".rm").onclick = e => { e.stopPropagation(); removePeer(d.id); };
@@ -278,7 +301,7 @@ function pickFiles() {
 const rates = {}; // transfer id -> {sent, t} for speed calc
 
 function fileRow(opts) {
-  const { name, size, pct, status, label, sub, cancelId, retryId, showFolder } = opts;
+  const { name, size, pct, status, label, sub, cancelId, retryId, showFolder, pauseId, resumeId } = opts;
   const r = document.createElement("div");
   r.className = "file " + (status || "");
   r.innerHTML = `<div class="meta">
@@ -286,9 +309,13 @@ function fileRow(opts) {
       <div class="bar"><i style="width:${pct}%"></i></div></div>
     <div class="pct">${label}</div>` +
     (retryId ? `<div class="retry">Retry</div>` : "") +
+    (pauseId ? `<div class="pause">Pause</div>` : "") +
+    (resumeId ? `<div class="pause">Resume</div>` : "") +
     (showFolder ? `<span class="openfolder" title="Open folder"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>` : "") +
     (cancelId ? `<div class="cancel">×</div>` : "");
   if (retryId) r.querySelector(".retry").onclick = () => retryTransfer(retryId);
+  if (pauseId) r.querySelector(".pause").onclick = () => pauseTransfer(pauseId);
+  if (resumeId) r.querySelector(".pause").onclick = () => resumeTransfer(resumeId);
   if (cancelId) r.querySelector(".cancel").onclick = () => cancelTransfer(cancelId);
   if (showFolder) r.querySelector(".openfolder").onclick = () => openFolder();
   return r;
@@ -303,19 +330,25 @@ function renderQueue() {
   for (const t of state.transfers) {
     const pct = t.size > 0 ? Math.round(t.sent / t.size * 100) : (t.status === "done" ? 100 : 0);
     const sending = t.status === "sending";
+    const paused = t.status === "paused";
+    const active = sending || paused;
     const recv = t.dir === "recv";
-    const label = t.status === "done" ? (recv ? "Received" : "Sent")
+    const label = paused ? "Paused"
+      : t.status === "done" ? (recv ? "Received" : "Sent")
       : t.status === "error" ? "Failed" : t.status === "canceled" ? "Canceled" : pct + "%";
     let sub = (recv ? "↓ from " : "↑ to ") + esc(t.peer || "");
-    if (sending) { sub += " · " + fmtSize(t.sent) + " / " + fmtSize(t.size); }
+    if (active) { sub += " · " + fmtSize(t.sent) + " / " + fmtSize(t.size); }
     else { sub += " · " + fmtSize(t.size); }
     if (sending && t.rate) sub += " · " + fmtSize(t.rate) + "/s";
+    if (paused) sub += " · paused";
     q.appendChild(fileRow({
       name: t.name, size: t.size, pct, sub, label,
       status: t.status === "error" ? "err" : t.status === "done" ? "done" : t.status === "canceled" ? "err" : "",
-      cancelId: (sending && !recv) ? t.id : null,
+      cancelId: (active && !recv) ? t.id : null,
       retryId: t.retryable ? t.id : null,
-      showFolder: t.status === "done"
+      showFolder: t.status === "done",
+      pauseId: (sending && !recv) ? t.id : null,
+      resumeId: (paused && !recv) ? t.id : null
     }));
   }
   for (const f of state.staged) q.appendChild(fileRow({ name: f.name, size: f.size, pct: 0, sub: fmtSize(f.size), label: "Ready" }));
@@ -323,6 +356,14 @@ function renderQueue() {
 
 async function cancelTransfer(id) {
   try { await apiFetch("/api/transfers/cancel?id=" + encodeURIComponent(id), { method: "POST" }); pollTransfers(); } catch {}
+}
+
+async function pauseTransfer(id) {
+  try { await apiFetch("/api/transfers/pause?id=" + encodeURIComponent(id), { method: "POST" }); pollTransfers(); } catch {}
+}
+
+async function resumeTransfer(id) {
+  try { await apiFetch("/api/transfers/resume?id=" + encodeURIComponent(id), { method: "POST" }); pollTransfers(); } catch {}
 }
 
 async function retryTransfer(id) {
@@ -345,6 +386,7 @@ function updateSend() {
   } else {
     $("#hint").textContent = "Sending to " + tgt.name;
   }
+  if (typeof updateTextHint === "function") updateTextHint();
 }
 
 async function sendAll() {
@@ -570,6 +612,8 @@ setInterval(loadMe, 4000);        // refresh own IP on network change
 setInterval(pollDevices, 2000);
 setInterval(pollTransfers, 700);
 setInterval(refreshPairedStatus, 10000);
+
 </script>
+<script src="chat.js"></script>
 </body>
 </html>

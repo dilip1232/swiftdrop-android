@@ -38,8 +38,18 @@ class HttpServer : NanoHTTPD(State.PORT) {
             uri == "/api/transfers" -> withToken(session) { json(transfersJson()) }
             uri == "/api/transfers/clear" -> withToken(session) { clearFinished(); json("""{"ok":true}""") }
             uri == "/api/transfers/cancel" -> withToken(session) { cancelTransfer(session); json("""{"ok":true}""") }
+            uri == "/api/transfers/pause" -> withToken(session) { pauseTransfer(session) }
+            uri == "/api/transfers/resume" -> withToken(session) { resumeTransfer(session) }
             uri == "/api/transfers/retry" && session.method == Method.POST -> withToken(session) { retryTransfer(session) }
+            uri == "/api/transfers/accept" -> withToken(session) { handleAcceptReject(session, true) }
+            uri == "/api/transfers/reject" -> withToken(session) { handleAcceptReject(session, false) }
             uri == "/api/send-path" && session.method == Method.POST -> withToken(session) { handleSend(session) }
+            uri == "/transfer-signal" && session.method == Method.POST -> handleTransferSignal(session)
+            uri == "/chat-inbox" && session.method == Method.POST -> handleChatInbox(session)
+            uri == "/api/chat/send" && session.method == Method.POST -> withToken(session) { handleChatSend(session) }
+            uri == "/api/chat/messages" -> withToken(session) { handleChatMessages(session) }
+            uri == "/api/chat/notify" -> withToken(session) { handleChatNotify() }
+            uri == "/api/chat/notify/ack" -> withToken(session) { handleChatNotifyAck() }
             uri == "/api/peers/add" && session.method == Method.POST -> handleAddPeer(session) // public — peers announce themselves
             uri == "/api/peers/remove" && session.method == Method.POST -> withToken(session) { handleRemovePeer(session) }
             // Pairing
@@ -99,8 +109,26 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val len = session.headers["content-length"]?.toLongOrNull() ?: -1L
 
         // Reject files from unpaired senders.
-        if (fromID.isEmpty() || PairStore.isPaired(fromID) == null) {
+        val pairKey = PairStore.isPaired(fromID)
+        if (fromID.isEmpty() || pairKey == null) {
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "not paired — pair first")
+        }
+
+        // Verify HMAC sender authentication to prevent X-From-ID spoofing.
+        val authHMAC = session.headers["x-auth-hmac"]
+        if (!authHMAC.isNullOrEmpty()) {
+            val authTime = session.headers["x-auth-time"] ?: ""
+            val ts = authTime.toLongOrNull() ?: 0L
+            val delta = kotlin.math.abs(System.currentTimeMillis() / 1000 - ts)
+            if (delta > 300) {
+                return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "auth timestamp expired")
+            }
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(javax.crypto.spec.SecretKeySpec(pairKey, "HmacSHA256"))
+            val expected = mac.doFinal("$fromID|$name|$authTime".toByteArray()).joinToString("") { "%02x".format(it) }
+            if (authHMAC != expected) {
+                return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "authentication failed")
+            }
         }
 
         // Check free disk space using original file size.
@@ -118,8 +146,27 @@ class HttpServer : NanoHTTPD(State.PORT) {
         // the original file size from X-File-Size for progress tracking.
         val trackSize = if (len > 0) len else (session.headers["x-file-size"]?.toLongOrNull() ?: 0L)
 
+        // ── Receiver consent: block until the user accepts or 60s timeout ──
+        val tr = State.newPendingTransfer(name, trackSize, from)
+        val sizeStr = humanSize(trackSize)
+        val activity = State.foregroundActivity
+        if (activity != null) {
+            // In-app styled dialog when the Activity is visible.
+            activity.runOnUiThread {
+                showConsentDialog(activity, tr, from, name, sizeStr)
+            }
+        } else {
+            // Background: use notification with action buttons.
+            Notifier.showConsentNotification(State.appContext, tr.id, from, name, sizeStr)
+        }
+        val responded = tr.decision.await(60, java.util.concurrent.TimeUnit.SECONDS)
+        if (!responded || !tr.accepted) {
+            tr.status = "error"; tr.err = if (responded) "rejected by user" else "no response — auto-rejected"
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, tr.err)
+        }
+        tr.status = "sending"
+
         val cr = State.appContext.contentResolver
-        val tr = State.newTransfer(name, trackSize, from, "recv")
         Notifier.refreshServiceNotification()
         PowerLocks.begin()
 
@@ -135,47 +182,44 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val encrypted = session.headers["x-encrypted"] == "aes-gcm"
         val senderId = session.headers["x-from-id"] ?: ""
 
+        // Hash on-the-fly so we never re-read the file from disk.
+        val md = java.security.MessageDigest.getInstance("SHA-256")
         try {
-            cr.openOutputStream(dest).use { out ->
-                requireNotNull(out) { "cannot open output" }
+            cr.openOutputStream(dest).use { rawOut ->
+                requireNotNull(rawOut) { "cannot open output" }
                 val input = session.inputStream
 
                 if (encrypted) {
                     val key = PairStore.isPaired(senderId)
                         ?: throw IllegalStateException("not paired with sender")
-                    // Wrap output to track decrypted bytes for progress.
+                    // BufferedOutputStream + counting + hashing wrapper.
+                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
                     val counting = object : java.io.OutputStream() {
-                        override fun write(b: Int) { out.write(b); tr.sent.incrementAndGet() }
-                        override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); tr.sent.addAndGet(len.toLong()) }
-                        override fun flush() = out.flush()
+                        override fun write(b: Int) { buffered.write(b); md.update(b.toByte()); tr.sent.incrementAndGet() }
+                        override fun write(b: ByteArray, off: Int, len: Int) { buffered.write(b, off, len); md.update(b, off, len); tr.sent.addAndGet(len.toLong()) }
+                        override fun flush() = buffered.flush()
                     }
                     Crypto.decryptStream(counting, input, key)
+                    buffered.flush()
                 } else {
+                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
                     val buf = ByteArray(256 * 1024)
                     var remaining = if (len >= 0) len else Long.MAX_VALUE
                     while (remaining > 0) {
                         val want = if (len >= 0) minOf(buf.size.toLong(), remaining).toInt() else buf.size
                         val n = input.read(buf, 0, want)
                         if (n < 0) break
-                        out.write(buf, 0, n)
+                        buffered.write(buf, 0, n)
+                        md.update(buf, 0, n)
                         remaining -= n
                         tr.sent.addAndGet(n.toLong())
                     }
+                    buffered.flush()
                 }
-                out.flush()
             }
-            // Verify SHA-256 integrity if the sender included a hash.
+            // Verify SHA-256 integrity if the sender included a hash (hashed on-the-fly above).
             val expected = session.headers["x-sha256"]
             if (!expected.isNullOrBlank()) {
-                val md = java.security.MessageDigest.getInstance("SHA-256")
-                cr.openInputStream(dest)?.use { verifyInput ->
-                    val vbuf = ByteArray(256 * 1024)
-                    while (true) {
-                        val n = verifyInput.read(vbuf)
-                        if (n < 0) break
-                        md.update(vbuf, 0, n)
-                    }
-                }
                 val actual = md.digest().joinToString("") { "%02x".format(it) }
                 if (actual != expected) {
                     runCatching { cr.delete(dest, null, null) }
@@ -273,7 +317,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
 
     private fun devicesJson(): String {
         val arr = JSONArray()
-        for (p in State.peers.values) {
+        for (p in State.allPeers()) {
             arr.put(JSONObject().apply {
                 put("id", p.id); put("name", p.name)
                 put("platform", p.platform); put("host", p.host); put("manual", p.manual)
@@ -283,12 +327,13 @@ class HttpServer : NanoHTTPD(State.PORT) {
     }
 
     private fun clearFinished() {
-        State.transfers.removeAll { it.status != "sending" }
+        State.transfers.removeAll { it.status != "sending" && it.status != "pending" && it.status != "paused" }
     }
 
     private fun cancelTransfer(session: IHTTPSession) {
         val id = session.parameters["id"]?.firstOrNull() ?: return
-        State.transfers.firstOrNull { it.id == id && it.status == "sending" }?.let {
+        State.transfers.firstOrNull { it.id == id && (it.status == "sending" || it.status == "paused") }?.let {
+            if (it.paused) it.resume() // unblock the streaming thread first
             it.canceled = true
             it.status = "canceled"
             // Force-disconnect the HTTP connection to abort the transfer immediately
@@ -313,6 +358,126 @@ class HttpServer : NanoHTTPD(State.PORT) {
         return json("""{"ok":true}""")
     }
 
+    private fun pauseTransfer(session: IHTTPSession): Response {
+        val id = session.parms["id"] ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "missing id")
+        val t = State.transfers.firstOrNull { it.id == id && it.status == "sending" }
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not sending")
+        t.pause()
+        t.peerId?.let { pid -> Thread { notifyPeerSignal(pid, t.name, "pause") }.start() }
+        return json("""{"ok":true}""")
+    }
+
+    private fun resumeTransfer(session: IHTTPSession): Response {
+        val id = session.parms["id"] ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "missing id")
+        val t = State.transfers.firstOrNull { it.id == id && it.status == "paused" }
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not paused")
+        t.resume()
+        t.peerId?.let { pid -> Thread { notifyPeerSignal(pid, t.name, "resume") }.start() }
+        return json("""{"ok":true}""")
+    }
+
+    private fun handleTransferSignal(session: IHTTPSession): Response {
+        val map = HashMap<String, String>()
+        session.parseBody(map)
+        val body = JSONObject(map["postData"] ?: "{}")
+        val file = body.optString("file", "")
+        val action = body.optString("action", "")
+        val peerName = session.headers["x-from-name"] ?: ""
+        if (file.isEmpty() || action.isEmpty() || peerName.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "bad request")
+        // Find the matching recv transfer and update its status.
+        for (t in State.transfers) {
+            if (t.dir != "recv" || t.name != file || t.peer != peerName) continue
+            when (action) {
+                "pause" -> if (t.status == "sending") t.status = "paused"
+                "resume" -> if (t.status == "paused") t.status = "sending"
+            }
+            break
+        }
+        return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "ok")
+    }
+
+    private fun notifyPeerSignal(peerId: String, fileName: String, action: String) {
+        val peer = State.peer(peerId) ?: return
+        try {
+            val url = java.net.URL("http://${peer.host}/transfer-signal")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 3000; conn.readTimeout = 3000
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("X-From-Name", State.deviceName)
+            conn.doOutput = true
+            conn.outputStream.use { it.write("""{"file":"$fileName","action":"$action"}""".toByteArray()) }
+            conn.responseCode // trigger the request
+            conn.disconnect()
+        } catch (_: Exception) { /* best-effort */ }
+    }
+
+    // ---- Chat ----
+
+    private fun handleChatInbox(session: IHTTPSession): Response {
+        val map = HashMap<String, String>()
+        session.parseBody(map)
+        val body = JSONObject(map["postData"] ?: "{}")
+        val text = body.optString("text", "")
+        val from = body.optString("from", "Unknown")
+        val fromId = body.optString("fromId", "")
+        if (text.isEmpty() || fromId.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "bad request")
+        State.chatStore.add(fromId, ChatMsg(text = text, from = from, dir = "recv"))
+        State.chatNotifyPeer = fromId
+        State.chatNotifyName = from
+        val snippet = if (text.length > 80) text.take(80) + "…" else text
+        Notifier.show(State.appContext, "Message from $from: $snippet")
+        return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "ok")
+    }
+
+    private fun handleChatSend(session: IHTTPSession): Response {
+        val map = HashMap<String, String>()
+        session.parseBody(map)
+        val body = JSONObject(map["postData"] ?: "{}")
+        val peerId = body.optString("peer", "")
+        val text = body.optString("text", "")
+        if (peerId.isEmpty() || text.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "bad request")
+        val peer = State.peer(peerId)
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "peer not found")
+        val msg = State.chatStore.add(peerId, ChatMsg(text = text, from = State.deviceName, dir = "sent"))
+        Thread {
+            try {
+                val url = java.net.URL("http://${peer.host}/chat-inbox")
+                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"; conn.connectTimeout = 5000; conn.readTimeout = 5000
+                conn.setRequestProperty("Content-Type", "application/json"); conn.doOutput = true
+                val payload = JSONObject().put("from", State.deviceName).put("fromId", State.deviceId).put("text", text).toString()
+                conn.outputStream.use { it.write(payload.toByteArray()) }
+                conn.responseCode; conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
+        return json("""{"ok":true,"id":"${msg.id}"}""")
+    }
+
+    private fun handleChatMessages(session: IHTTPSession): Response {
+        val peerId = session.parms["peer"] ?: ""
+        val since = session.parms["since"]?.toLongOrNull() ?: 0L
+        val msgs = State.chatStore.since(peerId, since)
+        val arr = JSONArray()
+        for (m in msgs) {
+            arr.put(JSONObject().put("id", m.id).put("text", m.text).put("from", m.from).put("dir", m.dir).put("ts", m.ts))
+        }
+        return json(arr.toString())
+    }
+
+    private fun handleChatNotify(): Response {
+        return json(JSONObject().put("peer", State.chatNotifyPeer ?: "").put("name", State.chatNotifyName ?: "").toString())
+    }
+
+    private fun handleChatNotifyAck(): Response {
+        State.chatNotifyPeer = null
+        State.chatNotifyName = null
+        return json("""{"ok":true}""")
+    }
+
     private fun transfersJson(): String {
         val arr = JSONArray()
         for (t in State.transfers) {
@@ -320,6 +485,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
                 put("id", t.id); put("name", t.name); put("size", t.size)
                 put("sent", t.sent.get()); put("status", t.status); put("peer", t.peer); put("dir", t.dir)
                 t.err?.let { put("err", it) }
+                if (t.paused) put("paused", true)
                 if (t.dir == "send" && (t.status == "error" || t.status == "canceled") && t.uri != null) put("retryable", true)
             })
         }
@@ -355,9 +521,33 @@ class HttpServer : NanoHTTPD(State.PORT) {
         else -> "application/octet-stream"
     }
 
+    private fun handleAcceptReject(session: IHTTPSession, accept: Boolean): Response {
+        val id = session.parameters["id"]?.firstOrNull() ?: ""
+        val tr = State.transfers.firstOrNull { it.id == id && it.status == "pending" }
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not pending")
+        tr.accepted = accept
+        tr.decision.countDown()
+        return json("""{"ok":true}""")
+    }
+
+    private fun humanSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB")
+        var value = bytes / 1024.0
+        var u = 0
+        while (value >= 1024 && u < units.size - 1) { value /= 1024; u++ }
+        return "%.1f %s".format(value, units[u])
+    }
+
     private fun safeName(raw: String): String {
-        val base = raw.substringAfterLast('/').substringAfterLast('\\')
-        return if (base.isBlank() || base == "." || base == "..") "received-file" else base
+        // First pass: strip path separators.
+        var name = raw.substringAfterLast('/').substringAfterLast('\\')
+        // Second pass: URL-decode then strip again to block %2F / %5C traversal.
+        try {
+            val decoded = java.net.URLDecoder.decode(name, "UTF-8")
+            name = decoded.substringAfterLast('/').substringAfterLast('\\')
+        } catch (_: Exception) { /* keep as-is if decode fails */ }
+        return if (name.isBlank() || name == "." || name == "..") "received-file" else name
     }
 
     // ---- pairing -----------------------------------------------------------
@@ -444,6 +634,111 @@ class HttpServer : NanoHTTPD(State.PORT) {
             ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "invalid or expired token")
         return json("""{"key":"${PairStore.bytesToHex(key)}"}"""
         )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun showConsentDialog(activity: android.app.Activity, tr: Transfer, from: String, fileName: String, size: String) {
+        val density = activity.resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val root = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(16))
+        }
+
+        // Header row: icon + title/sender
+        val header = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            layoutParams = android.widget.LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) }
+        }
+        val iconBg = android.widget.FrameLayout(activity).apply {
+            val bg = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF1E3A5F.toInt()); cornerRadius = dp(10).toFloat()
+            }
+            background = bg
+            layoutParams = android.widget.LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(12) }
+        }
+        val icon = android.widget.ImageView(activity).apply {
+            setImageResource(android.R.drawable.stat_sys_download)
+            setColorFilter(0xFF60A5FA.toInt())
+            layoutParams = android.widget.FrameLayout.LayoutParams(dp(20), dp(20), android.view.Gravity.CENTER)
+        }
+        iconBg.addView(icon)
+        header.addView(iconBg)
+        val titleCol = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        titleCol.addView(android.widget.TextView(activity).apply {
+            text = "Incoming file"; setTextColor(0xFFFFFFFF.toInt()); textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        })
+        titleCol.addView(android.widget.TextView(activity).apply {
+            text = "from $from"; setTextColor(0xFF8B8B8E.toInt()); textSize = 12f
+        })
+        header.addView(titleCol)
+        root.addView(header)
+
+        // File info pill
+        val pill = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            val bg = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF2C2C2E.toInt()); cornerRadius = dp(10).toFloat()
+            }
+            background = bg
+            layoutParams = android.widget.LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
+        }
+        pill.addView(android.widget.TextView(activity).apply {
+            text = fileName; setTextColor(0xFFE5E5E5.toInt()); textSize = 13f
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, -2, 1f)
+        })
+        pill.addView(android.widget.TextView(activity).apply {
+            text = size; setTextColor(0xFF8B8B8E.toInt()); textSize = 12f
+            layoutParams = android.widget.LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(10) }
+        })
+        root.addView(pill)
+
+        // Buttons
+        val row = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            layoutParams = android.widget.LinearLayout.LayoutParams(-1, -2)
+        }
+        val dlg = android.app.Dialog(activity).apply {
+            requestWindowFeature(android.view.Window.FEATURE_NO_TITLE); setCancelable(false)
+        }
+        row.addView(android.widget.TextView(activity).apply {
+            text = "Reject"; setTextColor(0xFFFF6961.toInt()); textSize = 14f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD; gravity = android.view.Gravity.CENTER
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) }
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF3A2A2A.toInt()); cornerRadius = dp(10).toFloat()
+            }
+            setOnClickListener { tr.accepted = false; tr.decision.countDown(); dlg.dismiss() }
+        })
+        row.addView(android.widget.TextView(activity).apply {
+            text = "Accept"; setTextColor(0xFFFFFFFF.toInt()); textSize = 14f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD; gravity = android.view.Gravity.CENTER
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(5) }
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF3478F6.toInt()); cornerRadius = dp(10).toFloat()
+            }
+            setOnClickListener { tr.accepted = true; tr.decision.countDown(); dlg.dismiss() }
+        })
+        root.addView(row)
+
+        dlg.setContentView(root)
+        dlg.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF1C1C1E.toInt()); cornerRadius = dp(16).toFloat()
+            })
+            setLayout((activity.resources.displayMetrics.widthPixels * 0.82).toInt(), android.view.WindowManager.LayoutParams.WRAP_CONTENT)
+            setDimAmount(0.5f)
+        }
+        dlg.show()
     }
 
     private fun handlePairClaim(session: IHTTPSession): Response {

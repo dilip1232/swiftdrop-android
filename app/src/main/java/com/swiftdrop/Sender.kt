@@ -75,6 +75,15 @@ object Sender {
                 setRequestProperty("X-From-ID", State.deviceId)
                 if (size > 0) setRequestProperty("X-File-Size", size.toString())
                 if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm")
+                // HMAC sender authentication.
+                if (key != null) {
+                    val ts = (System.currentTimeMillis() / 1000).toString()
+                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                    mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                    val sig = mac.doFinal("${State.deviceId}|$name|$ts".toByteArray())
+                    setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                    setRequestProperty("X-Auth-Time", ts)
+                }
                 connectTimeout = 8000
                 readTimeout = 0 // no timeout for large encrypted writes
                 if (wireSize >= 0) setFixedLengthStreamingMode(wireSize) else setChunkedStreamingMode(BUF)
@@ -86,8 +95,9 @@ object Sender {
                 if (encrypted) {
                     // Wrap input with a counting stream for progress.
                     val counting = CountingInputStream(input, t)
-                    Crypto.encryptStream(conn.outputStream, counting, key!!)
-                    conn.outputStream.flush()
+                    val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
+                    Crypto.encryptStream(bufferedOut, counting, key!!)
+                    bufferedOut.flush()
                 } else {
                     BufferedOutputStream(conn.outputStream, BUF).use { out ->
                         val buf = ByteArray(BUF)
@@ -126,12 +136,14 @@ object Sender {
         private val transfer: Transfer
     ) : InputStream() {
         override fun read(): Int {
+            transfer.awaitIfPaused()
             if (transfer.canceled) throw java.io.IOException("canceled")
             val b = inner.read()
             if (b >= 0) transfer.sent.incrementAndGet()
             return b
         }
         override fun read(buf: ByteArray, off: Int, len: Int): Int {
+            transfer.awaitIfPaused()
             if (transfer.canceled) throw java.io.IOException("canceled")
             val n = inner.read(buf, off, len)
             if (n > 0) transfer.sent.addAndGet(n.toLong())
