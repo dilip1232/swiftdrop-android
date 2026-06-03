@@ -1,5 +1,6 @@
 package com.swiftdrop
 
+import android.app.Activity
 import android.content.Context
 import android.os.Build
 import java.util.UUID
@@ -51,6 +52,7 @@ object State {
     val ignore = ConcurrentHashMap<String, Long>()       // id -> suppress-until (ms)
     val transfers = CopyOnWriteArrayList<Transfer>()
     private var seq = 0L
+    @Volatile var foregroundActivity: Activity? = null
 
     fun newPendingTransfer(name: String, size: Long, peer: String): Transfer {
         val t = Transfer("${System.currentTimeMillis()}-${++seq}", name, size, peer, "recv")

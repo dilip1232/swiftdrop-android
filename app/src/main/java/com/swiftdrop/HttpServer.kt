@@ -141,7 +141,22 @@ class HttpServer : NanoHTTPD(State.PORT) {
         // ── Receiver consent: block until the user accepts or 60s timeout ──
         val tr = State.newPendingTransfer(name, trackSize, from)
         val sizeStr = humanSize(trackSize)
-        Notifier.showConsentNotification(State.appContext, tr.id, from, name, sizeStr)
+        val activity = State.foregroundActivity
+        if (activity != null) {
+            // In-app dialog when the Activity is visible.
+            activity.runOnUiThread {
+                android.app.AlertDialog.Builder(activity)
+                    .setTitle("Incoming file from $from")
+                    .setMessage("$name ($sizeStr)")
+                    .setCancelable(false)
+                    .setPositiveButton("Accept") { d, _ -> tr.accepted = true; tr.decision.countDown(); d.dismiss() }
+                    .setNegativeButton("Reject") { d, _ -> tr.accepted = false; tr.decision.countDown(); d.dismiss() }
+                    .show()
+            }
+        } else {
+            // Background: use notification with action buttons.
+            Notifier.showConsentNotification(State.appContext, tr.id, from, name, sizeStr)
+        }
         val responded = tr.decision.await(60, java.util.concurrent.TimeUnit.SECONDS)
         if (!responded || !tr.accepted) {
             tr.status = "error"; tr.err = if (responded) "rejected by user" else "no response — auto-rejected"
