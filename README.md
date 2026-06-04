@@ -26,7 +26,10 @@ No Android Studio required — build and install entirely from the terminal.
 - **No file size cap** — transfers of any size; disk space checked before writing
 - **Automatic version bumping** — CI sets versionName and versionCode from git tag on release
 - **Per-device chat** — chat with individual paired devices; SVG icons, animated panel, unread indicator
-- **Receiver consent** — custom dark-themed accept/reject dialog before incoming transfers are written
+- **Folder transfer** — send and receive entire folders; files stream in parallel and the directory structure is preserved
+- **Partial transfer status** — cancelled folder transfers show exactly how many files were received
+- **Receiver consent** — accept/reject via in-app dialog, notification actions, or buttons in the transfer list
+- **Sticky consent notification** — the accept/reject notification cannot be dismissed without responding
 - **Pause/resume transfers** — pause and resume in-flight transfers; remote peer sees paused state
 - **HMAC authentication** — incoming transfers are verified with HMAC signatures
 - **EncryptedSharedPreferences** — paired keys stored securely via Android Keystore
