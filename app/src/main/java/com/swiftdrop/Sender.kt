@@ -6,12 +6,11 @@ import android.provider.OpenableColumns
 import java.io.BufferedOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.io.PipedInputStream
-import java.io.PipedOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Streams a file (given as a content URI) straight to a peer's /inbox using a
@@ -136,90 +135,89 @@ object Sender {
     }
 
     /**
-     * Zips a document tree (from OpenDocumentTree) on-the-fly and streams it
-     * to the peer as a single transfer with X-Folder: zip.
+     * Sends a folder to a peer using the parallel file-by-file protocol:
+     * 1) Announce → get consent + session token
+     * 2) Walk tree → send each file in parallel (4 threads)
+     * 3) Signal done
      */
     fun sendFolder(peer: Peer, treeUri: Uri, folderName: String, totalSize: Long, fileCount: Int) {
         val cr = State.appContext.contentResolver
         val key = PairStore.isPaired(peer.id)
-        val encrypted = key != null
 
-        val t = State.newTransfer(folderName, totalSize, peer.name, "send").also {
+        val t = State.newTransfer("\uD83D\uDCC1 $folderName", totalSize, peer.name, "send").also {
             it.uri = treeUri.toString()
             it.peerId = peer.id
         }
         Notifier.refreshServiceNotification()
         PowerLocks.begin()
-        var conn: HttpURLConnection? = null
         try {
-            // Pipe: zip writer in background thread → reader consumed by HTTP.
-            val pipedOut = PipedOutputStream()
-            val pipedIn = PipedInputStream(pipedOut, BUF)
-            val zipError = arrayOfNulls<Exception>(1)
-            val zipThread = Thread {
-                try {
-                    ZipOutputStream(BufferedOutputStream(pipedOut, BUF)).use { zos ->
-                        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-                        zipTreeChildren(cr, treeUri, rootDocId, "", zos, t)
+            // Phase 1: announce → session token.
+            t.status = "preparing"
+            val session = announceFolderToPeer(peer, key, folderName, totalSize, fileCount)
+                ?: run { t.status = "error"; t.err = "announce rejected"; return }
+            t.status = "sending"
+
+            // Phase 2: walk tree, collect files, send in parallel (4 threads).
+            data class FileEntry(val docUri: Uri, val relPath: String, val size: Long)
+            val files = mutableListOf<FileEntry>()
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            fun walk(parentDocId: String, prefix: String) {
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+                cr.query(childrenUri, arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
+                ), null, null, null)?.use { c ->
+                    val idIdx  = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val sizeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    while (c.moveToNext()) {
+                        val docId = c.getString(idIdx)
+                        val entryName = c.getString(nameIdx) ?: docId
+                        val mime = c.getString(mimeIdx)
+                        val entryPath = if (prefix.isEmpty()) entryName else "$prefix/$entryName"
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            walk(docId, entryPath)
+                        } else {
+                            val sz = if (sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx) else 0L
+                            files.add(FileEntry(
+                                DocumentsContract.buildDocumentUriUsingTree(treeUri, docId),
+                                entryPath, sz
+                            ))
+                        }
                     }
-                } catch (e: Exception) {
-                    zipError[0] = e
-                } finally {
-                    runCatching { pipedOut.close() }
                 }
             }
-            zipThread.start()
+            walk(rootDocId, "")
 
-            conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                setRequestProperty("Content-Type", "application/octet-stream")
-                setRequestProperty("X-Filename", folderName)
-                setRequestProperty("X-From", State.deviceName)
-                setRequestProperty("X-From-ID", State.deviceId)
-                if (totalSize > 0) setRequestProperty("X-File-Size", totalSize.toString())
-                setRequestProperty("X-Folder", "zip")
-                if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm-v2")
-                if (key != null) {
-                    val ts = (System.currentTimeMillis() / 1000).toString()
-                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-                    mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
-                    val sig = mac.doFinal("${State.deviceId}|$folderName|$ts".toByteArray())
-                    setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
-                    setRequestProperty("X-Auth-Time", ts)
-                }
-                connectTimeout = 8000
-                readTimeout = 0
-                setChunkedStreamingMode(BUF) // zip size is unknown
-            }
-            t.conn = conn
-
-            // Progress is tracked by raw bytes read in zipTreeChildren,
-            // not by zip/encrypted output bytes, so it matches totalSize.
-            if (encrypted) {
-                val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
-                Crypto.encryptStream(bufferedOut, pipedIn, key!!)
-                bufferedOut.flush()
-            } else {
-                BufferedOutputStream(conn.outputStream, BUF).use { out ->
-                    val buf = ByteArray(BUF)
-                    while (true) {
-                        if (t.canceled) { conn.disconnect(); return }
-                        val n = pipedIn.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
+            val firstErr = AtomicReference<String?>(null)
+            val okCount = AtomicInteger(0)
+            val pool = Executors.newFixedThreadPool(4)
+            for (fe in files) {
+                pool.submit {
+                    if (t.canceled) return@submit
+                    try {
+                        sendFolderFile(peer, key, fe.docUri, fe.relPath, fe.size, session, t)
+                        okCount.incrementAndGet()
+                    } catch (e: Exception) {
+                        firstErr.compareAndSet(null, e.message ?: "send failed")
+                        android.util.Log.w("SwiftDrop", "folder-file ${fe.relPath} failed: ${e.message}")
                     }
-                    out.flush()
                 }
             }
-            pipedIn.close()
-            zipThread.join()
-            if (zipError[0] != null) throw zipError[0]!!
+            pool.shutdown()
+            pool.awaitTermination(Long.MAX_VALUE, java.util.concurrent.TimeUnit.MILLISECONDS)
 
-            val code = conn.responseCode
-            conn.disconnect()
-            if (code != 200) {
-                t.status = "error"; t.err = "peer returned $code"
+            // Phase 3: signal done (always, even on partial failure/cancel).
+            sendFolderDone(peer, key, folderName, session, cancelled = t.canceled)
+
+            if (t.canceled) {
+                t.status = "canceled"
+            } else if (firstErr.get() != null && okCount.get() < files.size) {
+                t.status = "error"
+                t.err = "${okCount.get()}/${files.size} files sent: ${firstErr.get()}"
             } else {
                 t.status = "done"
             }
@@ -227,53 +225,130 @@ object Sender {
             if (t.canceled) t.status = "canceled"
             else { t.status = "error"; t.err = e.message }
         } finally {
-            t.conn = null
             Notifier.refreshServiceNotification()
             PowerLocks.end()
         }
     }
 
-    /** Recursively add files from a document tree into a ZipOutputStream. */
-    private fun zipTreeChildren(
-        cr: android.content.ContentResolver, treeUri: Uri,
-        parentDocId: String, prefix: String,
-        zos: ZipOutputStream, t: Transfer
+    /** Send folder announce → returns session token or null if rejected. */
+    private fun announceFolderToPeer(
+        peer: Peer, key: ByteArray?, folderName: String, totalSize: Long, fileCount: Int
+    ): String? {
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = false  // no body
+            setRequestProperty("X-Filename", folderName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-File-Size", totalSize.toString())
+            setRequestProperty("X-Folder-Announce", "true")
+            setRequestProperty("X-Folder-Count", fileCount.toString())
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$folderName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            setRequestProperty("Content-Length", "0")
+            connectTimeout = 8000
+            readTimeout = 65_000 // receiver waits up to 60s for consent
+        }
+        return try {
+            if (conn.responseCode != 200) { conn.disconnect(); return null }
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            conn.disconnect()
+            org.json.JSONObject(body).optString("session", "").takeIf { it.isNotEmpty() }
+        } catch (_: Exception) { conn.disconnect(); null }
+    }
+
+    /** Send a single file belonging to a folder session. */
+    private fun sendFolderFile(
+        peer: Peer, key: ByteArray?, docUri: Uri, relPath: String,
+        fileSize: Long, session: String, t: Transfer
     ) {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
-        cr.query(childrenUri, arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE
-        ), null, null, null)?.use { c ->
-            val idIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-            while (c.moveToNext()) {
-                if (t.canceled) return
-                val docId = c.getString(idIdx)
-                val entryName = c.getString(nameIdx) ?: docId
-                val mime = c.getString(mimeIdx)
-                val entryPath = if (prefix.isEmpty()) entryName else "$prefix/$entryName"
-                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    zos.putNextEntry(ZipEntry("$entryPath/"))
-                    zos.closeEntry()
-                    zipTreeChildren(cr, treeUri, docId, entryPath, zos, t)
+        val cr = State.appContext.contentResolver
+        val encrypted = key != null
+        // Use sanitized relPath as X-Filename for unique HMAC (matches Go sender).
+        val hmacName = relPath.replace('/', '_')
+
+        val wireSize = if (encrypted) encryptedSize(fileSize) else fileSize
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Content-Type", "application/octet-stream")
+            setRequestProperty("X-Filename", hmacName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-File-Size", fileSize.toString())
+            setRequestProperty("X-Folder-Session", session)
+            setRequestProperty("X-Folder-Rel", relPath)
+            if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm-v2")
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$hmacName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            connectTimeout = 8000
+            readTimeout = 0
+            if (wireSize >= 0) setFixedLengthStreamingMode(wireSize) else setChunkedStreamingMode(BUF)
+        }
+        try {
+            cr.openInputStream(docUri).use { input ->
+                requireNotNull(input) { "cannot open $relPath" }
+                if (encrypted) {
+                    val counting = CountingInputStream(input, t)
+                    val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
+                    Crypto.encryptStream(bufferedOut, counting, key!!)
+                    bufferedOut.flush()
                 } else {
-                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-                    zos.putNextEntry(ZipEntry(entryPath))
-                    cr.openInputStream(docUri)?.use { input ->
+                    BufferedOutputStream(conn.outputStream, BUF).use { out ->
                         val buf = ByteArray(BUF)
                         while (true) {
+                            if (t.canceled) throw java.io.IOException("canceled")
                             val n = input.read(buf)
                             if (n < 0) break
-                            zos.write(buf, 0, n)
+                            out.write(buf, 0, n)
                             t.sent.addAndGet(n.toLong())
                         }
+                        out.flush()
                     }
-                    zos.closeEntry()
                 }
             }
+            val code = conn.responseCode
+            if (code != 200) throw java.io.IOException("peer returned $code")
+        } finally {
+            conn.disconnect()
         }
+    }
+
+    /** Signal the receiver that the folder transfer is complete. */
+    private fun sendFolderDone(peer: Peer, key: ByteArray?, folderName: String, session: String, cancelled: Boolean = false) {
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = false
+            setRequestProperty("X-Filename", folderName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-Folder-Done", session)
+            if (cancelled) setRequestProperty("X-Folder-Cancelled", "true")
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$folderName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            setRequestProperty("Content-Length", "0")
+            connectTimeout = 5000
+            readTimeout = 5000
+        }
+        try { conn.responseCode; conn.disconnect() } catch (_: Exception) { conn.disconnect() }
     }
 
     /** InputStream wrapper that updates a Transfer's sent counter and checks for cancellation. */

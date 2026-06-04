@@ -12,6 +12,7 @@ import android.os.Looper
 object Notifier {
     const val SERVICE_CHANNEL = "swiftdrop_service"
     const val ALERT_CHANNEL = "swiftdrop_alerts"
+    const val CONSENT_CHANNEL = "swiftdrop_consent"
     const val SERVICE_ID = 1
     private var alertId = 1000
 
@@ -31,6 +32,12 @@ object Notifier {
         )
         nm.createNotificationChannel(
             NotificationChannel(ALERT_CHANNEL, "Transfers", NotificationManager.IMPORTANCE_DEFAULT)
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CONSENT_CHANNEL, "Transfer requests", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Accept / Reject incoming file transfers"
+                setShowBadge(true)
+            }
         )
     }
 
@@ -188,15 +195,18 @@ object Notifier {
         }
         val rejectPI = android.app.PendingIntent.getBroadcast(ctx, notifId * 2 + 1, rejectIntent, flags)
 
-        val n = Notification.Builder(ctx, ALERT_CHANNEL)
+        val n = Notification.Builder(ctx, CONSENT_CHANNEL)
             .setContentTitle("Incoming file from $from")
             .setContentText("$fileName ($size)")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setAutoCancel(false)
             .setOngoing(true)
+            .setCategory(Notification.CATEGORY_ALARM)
             .addAction(Notification.Action.Builder(null, "Accept", acceptPI).build())
             .addAction(Notification.Action.Builder(null, "Reject", rejectPI).build())
             .build()
+        // FLAG_NO_CLEAR prevents dismissal via "Clear all".
+        n.flags = n.flags or Notification.FLAG_NO_CLEAR
         ctx.getSystemService(NotificationManager::class.java).notify(notifId, n)
         return notifId
     }

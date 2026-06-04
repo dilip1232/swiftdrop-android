@@ -82,6 +82,10 @@
   .file.done .pct { color: var(--ok); } .file.err .pct { color: var(--err); }
   .file .cancel { color: var(--muted); font-size: 20px; line-height: 1; padding: 4px 8px; }
   .file .cancel:active { color: var(--err); }
+  .file .accept { color: var(--ok); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--ok); border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  .file .accept:active { background: var(--ok); color: #fff; }
+  .file .reject { color: var(--err); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--err); border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  .file .reject:active { background: var(--err); color: #fff; }
   .file .retry { color: var(--accent); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; white-space: nowrap; }
   .file .retry:active { background: var(--accent); color: #fff; }
   .file .pause { color: var(--muted); font-size: 11px; font-weight: 600; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; white-space: nowrap; }
@@ -308,18 +312,23 @@ function fileIcon(isFolder) {
 }
 
 function fileRow(opts) {
-  const { name, size, pct, status, label, sub, cancelId, retryId, showFolder, pauseId, resumeId, isFolder } = opts;
+  const { name, size, pct, status, label, sub, cancelId, retryId, showFolder, pendingId, pauseId, resumeId, isFolder } = opts;
   const r = document.createElement("div");
   r.className = "file " + (status || "");
   r.innerHTML = `<div class="meta">
       <div class="name">${fileIcon(isFolder)}${esc(name)}</div><div class="sub">${sub}</div>
       <div class="bar"><i style="width:${pct}%"></i></div></div>
     <div class="pct">${label}</div>` +
+    (pendingId ? `<div class="accept">Accept</div><div class="reject">Reject</div>` : "") +
     (retryId ? `<div class="retry">Retry</div>` : "") +
     (pauseId ? `<div class="pause">Pause</div>` : "") +
     (resumeId ? `<div class="pause">Resume</div>` : "") +
     (showFolder ? `<span class="openfolder" title="Open folder"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>` : "") +
     (cancelId ? `<div class="cancel">×</div>` : "");
+  if (pendingId) {
+    r.querySelector(".accept").onclick = () => respondTransfer(pendingId, true);
+    r.querySelector(".reject").onclick = () => respondTransfer(pendingId, false);
+  }
   if (retryId) r.querySelector(".retry").onclick = () => retryTransfer(retryId);
   if (pauseId) r.querySelector(".pause").onclick = () => pauseTransfer(pauseId);
   if (resumeId) r.querySelector(".pause").onclick = () => resumeTransfer(resumeId);
@@ -342,26 +351,30 @@ function renderQueue() {
     const paused = t.status === "paused";
     const active = sending || paused;
     const recv = t.dir === "recv";
+    const partial = t.status === "done" && t.err;
     const label = preparing ? "Preparing…"
       : pending ? "Pending"
       : paused ? "Paused"
+      : partial ? "Partial"
       : t.status === "done" ? (recv ? "Received" : "Sent")
       : t.status === "error" ? "Failed" : t.status === "canceled" ? "Canceled" : pct + "%";
     let sub = (recv ? "↓ from " : "↑ to ") + esc(t.peer || "");
-    if (preparing) { sub += " · zipping folder…"; }
+    if (preparing) { sub += " · preparing…"; }
     else if (pending) { sub += " · " + fmtSize(t.size) + " · waiting for approval"; }
     else if (active) { sub += " · " + fmtSize(t.sent) + " / " + fmtSize(t.size); }
     else { sub += " · " + fmtSize(t.size); }
     if (sending && t.rate) sub += " · " + fmtSize(t.rate) + "/s";
     if (paused) sub += " · paused";
+    if (partial) sub += " · " + t.err;
     const tIsFolder = t.name.startsWith("📁 ");
     const tName = tIsFolder ? t.name.slice(3) : t.name;
     q.appendChild(fileRow({
       name: tName, size: t.size, pct, sub, label, isFolder: tIsFolder,
-      status: t.status === "error" ? "err" : t.status === "done" ? "done" : t.status === "canceled" ? "err" : "",
+      status: t.status === "error" ? "err" : partial ? "" : t.status === "done" ? "done" : t.status === "canceled" ? "err" : "",
       cancelId: (active && !recv) ? t.id : null,
       retryId: t.retryable ? t.id : null,
       showFolder: t.status === "done",
+      pendingId: pending ? t.id : null,
       pauseId: (sending && !recv) ? t.id : null,
       resumeId: (paused && !recv) ? t.id : null
     }));
@@ -370,6 +383,11 @@ function renderQueue() {
     const sub = f.is_folder ? `${f.file_count} file${f.file_count !== 1 ? "s" : ""} · ${fmtSize(f.size)}` : fmtSize(f.size);
     q.appendChild(fileRow({ name: f.name, size: f.size, pct: 0, sub, label: "Ready", isFolder: f.is_folder }));
   }
+}
+
+async function respondTransfer(id, accept) {
+  const ep = accept ? "/api/transfers/accept" : "/api/transfers/reject";
+  try { await apiFetch(ep + "?id=" + encodeURIComponent(id), { method: "POST" }); pollTransfers(); } catch {}
 }
 
 async function cancelTransfer(id) {
