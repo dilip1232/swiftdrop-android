@@ -175,9 +175,10 @@ class MainActivity : AppCompatActivity() {
             val peerId = obj.getString("id")
             val token = obj.getString("token")
 
-            // POST to the remote device's /api/pair/qr-claim
+            // SPAKE2 Phase 1: use the QR token as the password (never sent raw).
+            val spakeState = Spake2.clientStart(token)
             val payload = JSONObject().apply {
-                put("token", token)
+                put("pake_msg", PairStore.bytesToHex(spakeState.msgA))
                 put("id", State.deviceId)
                 put("name", State.deviceName)
             }.toString()
@@ -198,16 +199,42 @@ class MainActivity : AppCompatActivity() {
 
             val result = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             conn.disconnect()
-            val keyHex = result.optString("key")
-            val keyBytes = ByteArray(keyHex.length / 2) { i ->
-                ((Character.digit(keyHex[2 * i], 16) shl 4) + Character.digit(keyHex[2 * i + 1], 16)).toByte()
+            // Verify SPAKE2 server response.
+            val srvMsg = PairStore.hexToBytes(result.optString("pake_msg"))
+            val srvConfirm = PairStore.hexToBytes(result.optString("pake_confirm"))
+            val spakeKey = try {
+                spakeState.finish(srvMsg, srvConfirm)
+            } catch (e: Exception) {
+                runOnUiThread { jsCallback(false, "QR pairing failed: wrong token") }
+                return
             }
+            val wrapped = PairStore.hexToBytes(result.optString("encrypted_key"))
+            val keyBytes = Spake2.aesGcmUnwrap(spakeKey, wrapped)
             if (keyBytes.size != 32) {
                 runOnUiThread { jsCallback(false, "invalid key from peer") }
                 return
             }
+            // SPAKE2 Phase 2: send client confirmation MAC.
+            val clientConfirm = Spake2.confirmMac(spakeKey, "client")
+            val confirmPayload = JSONObject().apply {
+                put("pake_confirm", PairStore.bytesToHex(clientConfirm))
+                put("id", State.deviceId)
+            }.toString()
+            val conn2 = (java.net.URL("http://$host/api/pair/pake-confirm").openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"; connectTimeout = 5000; readTimeout = 5000
+                setRequestProperty("Content-Type", "application/json")
+                doOutput = true
+            }
+            conn2.outputStream.use { it.write(confirmPayload.toByteArray()) }
+            if (conn2.responseCode != 200) {
+                val err = conn2.errorStream?.bufferedReader()?.use { it.readText() } ?: "confirmation rejected"
+                conn2.disconnect()
+                runOnUiThread { jsCallback(false, err) }
+                return
+            }
+            conn2.disconnect()
             PairStore.storeKey(peerId, keyBytes)
-            Log.i("SwiftDrop", "QR paired with $peerId")
+            Log.i("SwiftDrop", "QR SPAKE2 paired with $peerId")
             runOnUiThread { jsCallback(true, null) }
         } catch (e: Exception) {
             Log.e("SwiftDrop", "QR pair failed", e)

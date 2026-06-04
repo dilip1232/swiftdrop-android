@@ -145,9 +145,12 @@ object PairStore {
     @Volatile private var pendingFails: Int = 0
 
     // Pending QR pairing offer
-    @Volatile private var qrToken: String? = null
-    @Volatile private var qrKey: ByteArray? = null
-    @Volatile private var qrExpiry: Long = 0
+    @Volatile var qrToken: String? = null
+        private set
+    @Volatile var qrKey: ByteArray? = null
+        private set
+    @Volatile var qrExpiry: Long = 0
+        private set
 
     // Pending SPAKE2 exchange (held between Phase 1 and Phase 2)
     @Volatile private var pakeSpakeKey: ByteArray? = null
@@ -253,6 +256,8 @@ object PairStore {
             keys[peerId] = pakePairKey!!
             pendingPIN = null; pendingKey = null; pendingFails = 0
             pakeSpakeKey = null; pakePairKey = null; pakePeerID = null
+            // Also consume QR token if this was a QR-based pairing.
+            qrToken = null; qrKey = null
             save()
             return true
         }
@@ -269,6 +274,7 @@ object PairStore {
         return qrToken!!
     }
 
+    @Deprecated("Use SPAKE2 flow via holdPAKE/confirmPAKE instead")
     fun claimQRToken(token: String, peerId: String): ByteArray? {
         synchronized(keys) {
             if (qrToken == null || token != qrToken || System.currentTimeMillis() > qrExpiry) return null
@@ -302,7 +308,7 @@ object PairStore {
         prefs.apply()
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
+    fun hexToBytes(hex: String): ByteArray {
         val len = hex.length
         val data = ByteArray(len / 2)
         for (i in 0 until len step 2) data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()

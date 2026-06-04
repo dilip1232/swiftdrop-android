@@ -678,12 +678,29 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val body = HashMap<String, String>()
         session.parseBody(body)
         val obj = JSONObject(body["postData"] ?: "{}")
-        val token = obj.optString("token")
         val peerId = obj.optString("id")
-        val key = PairStore.claimQRToken(token, peerId)
-            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "invalid or expired token")
-        return json("""{"key":"${PairStore.bytesToHex(key)}"}"""
-        )
+        val peerName = obj.optString("name")
+        val pakeMsg = obj.optString("pake_msg")
+        if (pakeMsg.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "pake_msg required")
+        // Use the QR token as the SPAKE2 password (256-bit entropy).
+        val token = PairStore.qrToken
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending QR pairing")
+        if (System.currentTimeMillis() > PairStore.qrExpiry)
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "QR token expired")
+        val qrKey = PairStore.qrKey
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending QR key")
+        val clientMsg = try { hexToBytes(pakeMsg) } catch (_: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "invalid pake_msg")
+        }
+        val result = try { Spake2.serverFinish(token, clientMsg) } catch (e: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "SPAKE2 failed: ${e.message}")
+        }
+        val wrapped = Spake2.aesGcmWrap(result.sharedKey, qrKey)
+        // Hold — do NOT commit yet. Wait for client confirmation in Phase 2.
+        PairStore.holdPAKE(peerId, result.sharedKey, qrKey)
+        android.util.Log.i("SwiftDrop", "QR SPAKE2 exchange with $peerName ($peerId) — awaiting confirmation")
+        return json("""{"pake_msg":"${bytesToHex(result.msgB)}","pake_confirm":"${bytesToHex(result.confirm)}","encrypted_key":"${bytesToHex(wrapped)}"}""")
     }
 
     @Suppress("DEPRECATION")
