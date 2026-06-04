@@ -33,6 +33,7 @@ object Crypto {
 
         val buf = ByteArray(CHUNK_PLAIN)
         val lenBuf = ByteBuffer.allocate(4)
+        val aadBuf = ByteBuffer.allocate(8)
         val secretKey = SecretKeySpec(key, "AES")
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         val nonce = baseNonce.copyOf()
@@ -42,6 +43,8 @@ object Crypto {
             if (n <= 0) break
             chunkNonceInPlace(nonce, baseNonce, idx)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(TAG_BITS, nonce))
+            aadBuf.clear(); aadBuf.putLong(idx)
+            cipher.updateAAD(aadBuf.array())
             val ct = cipher.doFinal(buf, 0, n)
             lenBuf.clear(); lenBuf.putInt(ct.size)
             out.write(lenBuf.array())
@@ -54,11 +57,22 @@ object Crypto {
         out.flush()
     }
 
+    /** Decrypt v2 stream (with chunk-index AAD). */
     fun decryptStream(out: OutputStream, inp: InputStream, key: ByteArray) {
+        decryptStreamImpl(out, inp, key, useAAD = true)
+    }
+
+    /** Decrypt legacy v1 stream (no AAD). */
+    fun decryptStreamV1(out: OutputStream, inp: InputStream, key: ByteArray) {
+        decryptStreamImpl(out, inp, key, useAAD = false)
+    }
+
+    private fun decryptStreamImpl(out: OutputStream, inp: InputStream, key: ByteArray, useAAD: Boolean) {
         val baseNonce = ByteArray(NONCE_SIZE)
         readExact(inp, baseNonce)
 
         val lenBuf = ByteArray(4)
+        val aadBuf = ByteBuffer.allocate(8)
         val secretKey = SecretKeySpec(key, "AES")
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         val nonce = baseNonce.copyOf()
@@ -73,6 +87,10 @@ object Crypto {
             readExact(inp, ctBuf, cLen)
             chunkNonceInPlace(nonce, baseNonce, idx)
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_BITS, nonce))
+            if (useAAD) {
+                aadBuf.clear(); aadBuf.putLong(idx)
+                cipher.updateAAD(aadBuf.array())
+            }
             val pt = cipher.doFinal(ctBuf, 0, cLen)
             out.write(pt)
             idx++
@@ -127,9 +145,18 @@ object PairStore {
     @Volatile private var pendingFails: Int = 0
 
     // Pending QR pairing offer
-    @Volatile private var qrToken: String? = null
-    @Volatile private var qrKey: ByteArray? = null
-    @Volatile private var qrExpiry: Long = 0
+    @Volatile var qrToken: String? = null
+        private set
+    @Volatile var qrKey: ByteArray? = null
+        private set
+    @Volatile var qrExpiry: Long = 0
+        private set
+
+    // Pending SPAKE2 exchange (held between Phase 1 and Phase 2)
+    @Volatile private var pakeSpakeKey: ByteArray? = null
+    @Volatile private var pakePairKey: ByteArray? = null
+    @Volatile private var pakePeerID: String? = null
+    @Volatile private var pakeExpiry: Long = 0
 
     private fun encryptedPrefs(ctx: Context): android.content.SharedPreferences {
         return androidx.security.crypto.EncryptedSharedPreferences.create(
@@ -201,6 +228,41 @@ object PairStore {
         }
     }
 
+    /** Hold SPAKE2 state without committing. Pairing finalizes on confirmPAKE. */
+    fun holdPAKE(peerId: String, spakeKey: ByteArray, pairKey: ByteArray) {
+        synchronized(keys) {
+            pakeSpakeKey = spakeKey
+            pakePairKey = pairKey
+            pakePeerID = peerId
+            pakeExpiry = System.currentTimeMillis() + 30_000
+        }
+    }
+
+    /** Verify client confirmation MAC and finalize the pairing. */
+    fun confirmPAKE(peerId: String, clientConfirm: ByteArray): Boolean {
+        synchronized(keys) {
+            val sk = pakeSpakeKey ?: return false
+            if (pakePeerID != peerId || System.currentTimeMillis() > pakeExpiry) return false
+            val expected = Spake2.confirmMac(sk, "client")
+            if (!java.security.MessageDigest.isEqual(clientConfirm, expected)) {
+                pendingFails++
+                if (pendingFails >= 3) {
+                    pendingPIN = null
+                    pendingKey = null
+                }
+                pakeSpakeKey = null; pakePairKey = null; pakePeerID = null
+                return false
+            }
+            keys[peerId] = pakePairKey!!
+            pendingPIN = null; pendingKey = null; pendingFails = 0
+            pakeSpakeKey = null; pakePairKey = null; pakePeerID = null
+            // Also consume QR token if this was a QR-based pairing.
+            qrToken = null; qrKey = null
+            save()
+            return true
+        }
+    }
+
     fun generateQRToken(): String {
         val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val tok = ByteArray(32).also { SecureRandom().nextBytes(it) }
@@ -212,6 +274,7 @@ object PairStore {
         return qrToken!!
     }
 
+    @Deprecated("Use SPAKE2 flow via holdPAKE/confirmPAKE instead")
     fun claimQRToken(token: String, peerId: String): ByteArray? {
         synchronized(keys) {
             if (qrToken == null || token != qrToken || System.currentTimeMillis() > qrExpiry) return null
@@ -245,7 +308,7 @@ object PairStore {
         prefs.apply()
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
+    fun hexToBytes(hex: String): ByteArray {
         val len = hex.length
         val data = ByteArray(len / 2)
         for (i in 0 until len step 2) data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()

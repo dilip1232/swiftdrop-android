@@ -1,12 +1,16 @@
 package com.swiftdrop
 
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import java.io.BufferedOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Streams a file (given as a content URI) straight to a peer's /inbox using a
@@ -74,7 +78,7 @@ object Sender {
                 setRequestProperty("X-From", State.deviceName)
                 setRequestProperty("X-From-ID", State.deviceId)
                 if (size > 0) setRequestProperty("X-File-Size", size.toString())
-                if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm")
+                if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm-v2")
                 // HMAC sender authentication.
                 if (key != null) {
                     val ts = (System.currentTimeMillis() / 1000).toString()
@@ -128,6 +132,223 @@ object Sender {
             Notifier.refreshServiceNotification()
             PowerLocks.end()
         }
+    }
+
+    /**
+     * Sends a folder to a peer using the parallel file-by-file protocol:
+     * 1) Announce → get consent + session token
+     * 2) Walk tree → send each file in parallel (4 threads)
+     * 3) Signal done
+     */
+    fun sendFolder(peer: Peer, treeUri: Uri, folderName: String, totalSize: Long, fileCount: Int) {
+        val cr = State.appContext.contentResolver
+        val key = PairStore.isPaired(peer.id)
+
+        val t = State.newTransfer("\uD83D\uDCC1 $folderName", totalSize, peer.name, "send").also {
+            it.uri = treeUri.toString()
+            it.peerId = peer.id
+        }
+        Notifier.refreshServiceNotification()
+        PowerLocks.begin()
+        try {
+            // Phase 1: announce → session token.
+            t.status = "preparing"
+            val session = announceFolderToPeer(peer, key, folderName, totalSize, fileCount)
+                ?: run { t.status = "error"; t.err = "announce rejected"; return }
+            t.status = "sending"
+
+            // Phase 2: walk tree, collect files, send in parallel (4 threads).
+            data class FileEntry(val docUri: Uri, val relPath: String, val size: Long)
+            val files = mutableListOf<FileEntry>()
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            fun walk(parentDocId: String, prefix: String) {
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+                cr.query(childrenUri, arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
+                ), null, null, null)?.use { c ->
+                    val idIdx  = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val sizeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    while (c.moveToNext()) {
+                        val docId = c.getString(idIdx)
+                        val entryName = c.getString(nameIdx) ?: docId
+                        val mime = c.getString(mimeIdx)
+                        val entryPath = if (prefix.isEmpty()) entryName else "$prefix/$entryName"
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            walk(docId, entryPath)
+                        } else {
+                            val sz = if (sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx) else 0L
+                            files.add(FileEntry(
+                                DocumentsContract.buildDocumentUriUsingTree(treeUri, docId),
+                                entryPath, sz
+                            ))
+                        }
+                    }
+                }
+            }
+            walk(rootDocId, "")
+
+            val firstErr = AtomicReference<String?>(null)
+            val okCount = AtomicInteger(0)
+            val pool = Executors.newFixedThreadPool(4)
+            for (fe in files) {
+                pool.submit {
+                    if (t.canceled) return@submit
+                    try {
+                        sendFolderFile(peer, key, fe.docUri, fe.relPath, fe.size, session, t)
+                        okCount.incrementAndGet()
+                    } catch (e: Exception) {
+                        firstErr.compareAndSet(null, e.message ?: "send failed")
+                        android.util.Log.w("SwiftDrop", "folder-file ${fe.relPath} failed: ${e.message}")
+                    }
+                }
+            }
+            pool.shutdown()
+            pool.awaitTermination(Long.MAX_VALUE, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+            // Phase 3: signal done (always, even on partial failure/cancel).
+            sendFolderDone(peer, key, folderName, session, cancelled = t.canceled)
+
+            if (t.canceled) {
+                t.status = "canceled"
+            } else if (firstErr.get() != null && okCount.get() < files.size) {
+                t.status = "error"
+                t.err = "${okCount.get()}/${files.size} files sent: ${firstErr.get()}"
+            } else {
+                t.status = "done"
+            }
+        } catch (e: Exception) {
+            if (t.canceled) t.status = "canceled"
+            else { t.status = "error"; t.err = e.message }
+        } finally {
+            Notifier.refreshServiceNotification()
+            PowerLocks.end()
+        }
+    }
+
+    /** Send folder announce → returns session token or null if rejected. */
+    private fun announceFolderToPeer(
+        peer: Peer, key: ByteArray?, folderName: String, totalSize: Long, fileCount: Int
+    ): String? {
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = false  // no body
+            setRequestProperty("X-Filename", folderName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-File-Size", totalSize.toString())
+            setRequestProperty("X-Folder-Announce", "true")
+            setRequestProperty("X-Folder-Count", fileCount.toString())
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$folderName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            setRequestProperty("Content-Length", "0")
+            connectTimeout = 8000
+            readTimeout = 65_000 // receiver waits up to 60s for consent
+        }
+        return try {
+            if (conn.responseCode != 200) { conn.disconnect(); return null }
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            conn.disconnect()
+            org.json.JSONObject(body).optString("session", "").takeIf { it.isNotEmpty() }
+        } catch (_: Exception) { conn.disconnect(); null }
+    }
+
+    /** Send a single file belonging to a folder session. */
+    private fun sendFolderFile(
+        peer: Peer, key: ByteArray?, docUri: Uri, relPath: String,
+        fileSize: Long, session: String, t: Transfer
+    ) {
+        val cr = State.appContext.contentResolver
+        val encrypted = key != null
+        // Use sanitized relPath as X-Filename for unique HMAC (matches Go sender).
+        val hmacName = relPath.replace('/', '_')
+
+        val wireSize = if (encrypted) encryptedSize(fileSize) else fileSize
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Content-Type", "application/octet-stream")
+            setRequestProperty("X-Filename", hmacName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-File-Size", fileSize.toString())
+            setRequestProperty("X-Folder-Session", session)
+            setRequestProperty("X-Folder-Rel", relPath)
+            if (encrypted) setRequestProperty("X-Encrypted", "aes-gcm-v2")
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$hmacName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            connectTimeout = 8000
+            readTimeout = 0
+            if (wireSize >= 0) setFixedLengthStreamingMode(wireSize) else setChunkedStreamingMode(BUF)
+        }
+        try {
+            cr.openInputStream(docUri).use { input ->
+                requireNotNull(input) { "cannot open $relPath" }
+                if (encrypted) {
+                    val counting = CountingInputStream(input, t)
+                    val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
+                    Crypto.encryptStream(bufferedOut, counting, key!!)
+                    bufferedOut.flush()
+                } else {
+                    BufferedOutputStream(conn.outputStream, BUF).use { out ->
+                        val buf = ByteArray(BUF)
+                        while (true) {
+                            if (t.canceled) throw java.io.IOException("canceled")
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            t.sent.addAndGet(n.toLong())
+                        }
+                        out.flush()
+                    }
+                }
+            }
+            val code = conn.responseCode
+            if (code != 200) throw java.io.IOException("peer returned $code")
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** Signal the receiver that the folder transfer is complete. */
+    private fun sendFolderDone(peer: Peer, key: ByteArray?, folderName: String, session: String, cancelled: Boolean = false) {
+        val conn = (URL("http://${peer.host}/inbox").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = false
+            setRequestProperty("X-Filename", folderName)
+            setRequestProperty("X-From", State.deviceName)
+            setRequestProperty("X-From-ID", State.deviceId)
+            setRequestProperty("X-Folder-Done", session)
+            if (cancelled) setRequestProperty("X-Folder-Cancelled", "true")
+            if (key != null) {
+                val ts = (System.currentTimeMillis() / 1000).toString()
+                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                val sig = mac.doFinal("${State.deviceId}|$folderName|$ts".toByteArray())
+                setRequestProperty("X-Auth-HMAC", sig.joinToString("") { "%02x".format(it) })
+                setRequestProperty("X-Auth-Time", ts)
+            }
+            setRequestProperty("Content-Length", "0")
+            connectTimeout = 5000
+            readTimeout = 5000
+        }
+        try { conn.responseCode; conn.disconnect() } catch (_: Exception) { conn.disconnect() }
     }
 
     /** InputStream wrapper that updates a Transfer's sent counter and checks for cancellation. */

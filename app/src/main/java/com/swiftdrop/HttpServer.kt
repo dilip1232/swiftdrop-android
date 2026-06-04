@@ -24,6 +24,18 @@ import java.io.ByteArrayOutputStream
  */
 class HttpServer : NanoHTTPD(State.PORT) {
 
+    private val replayCache = ReplayCache()
+
+    // Active folder sessions: sessionID → FolderSession
+    data class FolderSession(
+        val folderName: String,
+        val senderId: String,
+        val transfer: Transfer,
+        val created: Long = System.currentTimeMillis(),
+        val filesReceived: java.util.concurrent.atomic.AtomicInteger = java.util.concurrent.atomic.AtomicInteger(0)
+    )
+    private val folderSessions = java.util.concurrent.ConcurrentHashMap<String, FolderSession>()
+
     override fun serve(session: IHTTPSession): Response = try {
         val uri = session.uri
         when {
@@ -68,17 +80,14 @@ class HttpServer : NanoHTTPD(State.PORT) {
                 }
                 json("""{"ok":true}""")
             }
-            uri == "/api/pair/remote-unpair" -> {
-                val id = session.parameters["id"]?.firstOrNull() ?: ""
-                if (id.isNotEmpty()) PairStore.unpair(id)
-                json("""{"ok":true}""")
-            }
+            uri == "/api/pair/remote-unpair" -> handleRemoteUnpair(session)
             uri == "/api/pair/claim" && session.method == Method.POST -> handlePairClaim(session)
+            uri == "/api/pair/pake-confirm" && session.method == Method.POST -> handlePAKEConfirm(session)
             // QR-based pairing
             uri == "/api/pair/qr-begin" -> withToken(session) { handleQRBegin() }
             uri == "/api/pair/qr-claim" && session.method == Method.POST -> handleQRClaim(session)
-            uri == "/" || uri == "/index.html" -> asset("web/index.html", "text/html")
-            else -> asset("web$uri", mimeFor(uri))
+            uri == "/" || uri == "/index.html" -> localOnly(session) { asset("web/index.html", "text/html") }
+            else -> localOnly(session) { asset("web$uri", mimeFor(uri)) }
         }
     } catch (e: Exception) {
         newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.message ?: "error")
@@ -92,8 +101,18 @@ class HttpServer : NanoHTTPD(State.PORT) {
         return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, State.apiToken)
     }
 
+    private fun localOnly(session: IHTTPSession, block: () -> Response): Response {
+        val ip = session.remoteIpAddress ?: ""
+        if (ip.isNotEmpty() && ip != "127.0.0.1" && ip != "::1" && ip != "0:0:0:0:0:0:0:1")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "forbidden")
+        return block()
+    }
+
     private fun withToken(session: IHTTPSession, block: () -> Response): Response {
-        val tok = session.headers["x-api-token"] ?: session.parameters["token"]?.firstOrNull() ?: ""
+        val ip = session.remoteIpAddress ?: ""
+        if (ip.isNotEmpty() && ip != "127.0.0.1" && ip != "::1" && ip != "0:0:0:0:0:0:0:1")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "forbidden")
+        val tok = session.headers["x-api-token"] ?: ""
         if (tok != State.apiToken) {
             return newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "unauthorized")
         }
@@ -114,32 +133,53 @@ class HttpServer : NanoHTTPD(State.PORT) {
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "not paired — pair first")
         }
 
-        // Verify HMAC sender authentication to prevent X-From-ID spoofing.
+        // Verify HMAC sender authentication — mandatory for paired senders.
         val authHMAC = session.headers["x-auth-hmac"]
-        if (!authHMAC.isNullOrEmpty()) {
-            val authTime = session.headers["x-auth-time"] ?: ""
-            val ts = authTime.toLongOrNull() ?: 0L
-            val delta = kotlin.math.abs(System.currentTimeMillis() / 1000 - ts)
-            if (delta > 300) {
-                return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "auth timestamp expired")
-            }
-            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-            mac.init(javax.crypto.spec.SecretKeySpec(pairKey, "HmacSHA256"))
-            val expected = mac.doFinal("$fromID|$name|$authTime".toByteArray()).joinToString("") { "%02x".format(it) }
-            if (authHMAC != expected) {
-                return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "authentication failed")
-            }
+        if (authHMAC.isNullOrEmpty()) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "HMAC authentication required")
+        }
+        val authTime = session.headers["x-auth-time"] ?: ""
+        val ts = authTime.toLongOrNull() ?: 0L
+        val delta = kotlin.math.abs(System.currentTimeMillis() / 1000 - ts)
+        if (delta > 300) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "auth timestamp expired")
+        }
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(pairKey, "HmacSHA256"))
+        val expected = mac.doFinal("$fromID|$name|$authTime".toByteArray()).joinToString("") { "%02x".format(it) }
+        if (authHMAC != expected) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "authentication failed")
+        }
+        // Reject replayed HMAC values.
+        if (!replayCache.check(authHMAC)) {
+            android.util.Log.w("SwiftDrop", "inbox HMAC replay detected from $fromID")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "replay detected")
         }
 
-        // Check free disk space using original file size.
+        // ── Folder protocol: announce / file / done ──
+        if (session.headers["x-folder-announce"] == "true") {
+            return handleFolderAnnounce(session, name, from, fromID)
+        }
+        session.headers["x-folder-done"]?.takeIf { it.isNotEmpty() }?.let { sid ->
+            return handleFolderDone(session, sid, from)
+        }
+        session.headers["x-folder-session"]?.takeIf { it.isNotEmpty() }?.let { sid ->
+            return handleFolderFile(session, sid, from, fromID)
+        }
+
+        // Check free disk space using original file size (require positive size).
         val originalSize = session.headers["x-file-size"]?.toLongOrNull() ?: len
         val checkSize = if (originalSize > 0) originalSize else len
-        if (checkSize > 0) {
-            val stat = android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path)
-            val free = stat.availableBytes
-            if (checkSize > free - 100 * 1024 * 1024) {
-                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "not enough disk space")
-            }
+        if (checkSize <= 0) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "X-File-Size or Content-Length required")
+        }
+        val stat = android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path)
+        val free = stat.availableBytes
+        val headroom = 100L * 1024 * 1024
+        // Saturating add to prevent overflow.
+        val needed = if (checkSize > Long.MAX_VALUE - headroom) Long.MAX_VALUE else checkSize + headroom
+        if (needed > free) {
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "not enough disk space")
         }
 
         // Encrypted transfers are chunked (no Content-Length), so use
@@ -157,7 +197,7 @@ class HttpServer : NanoHTTPD(State.PORT) {
             }
         } else {
             // Background: use notification with action buttons.
-            Notifier.showConsentNotification(State.appContext, tr.id, from, name, sizeStr)
+            tr.consentNotifId = Notifier.showConsentNotification(State.appContext, tr.id, from, name, sizeStr)
         }
         val responded = tr.decision.await(60, java.util.concurrent.TimeUnit.SECONDS)
         if (!responded || !tr.accepted) {
@@ -170,6 +210,33 @@ class HttpServer : NanoHTTPD(State.PORT) {
         Notifier.refreshServiceNotification()
         PowerLocks.begin()
 
+        val encHdr = session.headers["x-encrypted"] ?: ""
+        val encrypted = encHdr == "aes-gcm-v2" || encHdr == "aes-gcm"
+        val senderId = session.headers["x-from-id"] ?: ""
+        val isFolder = session.headers["x-folder"] == "zip"
+
+        try {
+            if (isFolder) {
+                return receiveFolderTransfer(cr, session, tr, name, len, encHdr, encrypted, senderId)
+            } else {
+                return receiveFileTransfer(cr, session, tr, name, len, encHdr, encrypted, senderId)
+            }
+        } catch (e: Exception) {
+            tr.status = "error"; tr.err = e.message
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.message ?: "write failed")
+        } finally {
+            Notifier.refreshServiceNotification()
+            PowerLocks.end()
+        }
+    }
+
+    // ---- receive: single file → MediaStore --------------------------------
+
+    private fun receiveFileTransfer(
+        cr: android.content.ContentResolver, session: IHTTPSession,
+        tr: Transfer, name: String, len: Long,
+        encHdr: String, encrypted: Boolean, senderId: String
+    ): Response {
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
             put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop")
@@ -179,45 +246,12 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val dest: Uri = cr.insert(collection, values)
             ?: return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "insert failed")
 
-        val encrypted = session.headers["x-encrypted"] == "aes-gcm"
-        val senderId = session.headers["x-from-id"] ?: ""
-
-        // Hash on-the-fly so we never re-read the file from disk.
         val md = java.security.MessageDigest.getInstance("SHA-256")
         try {
             cr.openOutputStream(dest).use { rawOut ->
                 requireNotNull(rawOut) { "cannot open output" }
-                val input = session.inputStream
-
-                if (encrypted) {
-                    val key = PairStore.isPaired(senderId)
-                        ?: throw IllegalStateException("not paired with sender")
-                    // BufferedOutputStream + counting + hashing wrapper.
-                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
-                    val counting = object : java.io.OutputStream() {
-                        override fun write(b: Int) { buffered.write(b); md.update(b.toByte()); tr.sent.incrementAndGet() }
-                        override fun write(b: ByteArray, off: Int, len: Int) { buffered.write(b, off, len); md.update(b, off, len); tr.sent.addAndGet(len.toLong()) }
-                        override fun flush() = buffered.flush()
-                    }
-                    Crypto.decryptStream(counting, input, key)
-                    buffered.flush()
-                } else {
-                    val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
-                    val buf = ByteArray(256 * 1024)
-                    var remaining = if (len >= 0) len else Long.MAX_VALUE
-                    while (remaining > 0) {
-                        val want = if (len >= 0) minOf(buf.size.toLong(), remaining).toInt() else buf.size
-                        val n = input.read(buf, 0, want)
-                        if (n < 0) break
-                        buffered.write(buf, 0, n)
-                        md.update(buf, 0, n)
-                        remaining -= n
-                        tr.sent.addAndGet(n.toLong())
-                    }
-                    buffered.flush()
-                }
+                writeBody(rawOut, session.inputStream, tr, md, len, encHdr, encrypted, senderId)
             }
-            // Verify SHA-256 integrity if the sender included a hash (hashed on-the-fly above).
             val expected = session.headers["x-sha256"]
             if (!expected.isNullOrBlank()) {
                 val actual = md.digest().joinToString("") { "%02x".format(it) }
@@ -227,7 +261,6 @@ class HttpServer : NanoHTTPD(State.PORT) {
                     return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "integrity check failed")
                 }
             }
-
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             cr.update(dest, values, null, null)
@@ -237,11 +270,216 @@ class HttpServer : NanoHTTPD(State.PORT) {
         } catch (e: Exception) {
             tr.status = "error"; tr.err = e.message
             runCatching { cr.delete(dest, null, null) }
-            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.message ?: "write failed")
-        } finally {
-            Notifier.refreshServiceNotification()
-            PowerLocks.end()
+            throw e
         }
+    }
+
+    // ---- receive: folder → cache temp file → extract to MediaStore --------
+
+    private fun receiveFolderTransfer(
+        cr: android.content.ContentResolver, session: IHTTPSession,
+        tr: Transfer, name: String, len: Long,
+        encHdr: String, encrypted: Boolean, senderId: String
+    ): Response {
+        val folderLabel = name.substringBeforeLast(".").ifEmpty { name }
+        // Write the zip directly to app cache — never to shared MediaStore.
+        val tmpFile = java.io.File.createTempFile("sd-folder-", ".zip", State.appContext.cacheDir)
+        try {
+            tmpFile.outputStream().use { rawOut ->
+                writeBody(rawOut, session.inputStream, tr, null, len, encHdr, encrypted, senderId)
+            }
+        } catch (e: Exception) {
+            tmpFile.delete()
+            tr.status = "error"; tr.err = e.message
+            throw e
+        }
+        // Respond 200 immediately, extract in background.
+        tr.status = "done"
+        Thread {
+            try {
+                // Remove any stale entries from previous failed transfers with the
+                // same folder name so MediaStore can create the directory.
+                cleanStaleEntries(cr, folderLabel)
+                unzipFromFile(cr, tmpFile, folderLabel)
+                Notifier.show(State.appContext, "Received folder $folderLabel")
+            } catch (e: Exception) {
+                android.util.Log.e("SwiftDrop", "unzip $name failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                Notifier.show(State.appContext, "Received $name (unzip failed)")
+            } finally {
+                tmpFile.delete()
+            }
+        }.start()
+        return json("""{"ok":true}""")
+    }
+
+    /** Write (potentially encrypted) body to an output stream with progress tracking. */
+    private fun writeBody(
+        rawOut: java.io.OutputStream, input: java.io.InputStream,
+        tr: Transfer, md: java.security.MessageDigest?,
+        len: Long, encHdr: String, encrypted: Boolean, senderId: String
+    ) {
+        if (encrypted) {
+            val key = PairStore.isPaired(senderId)
+                ?: throw IllegalStateException("not paired with sender")
+            val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
+            val counting = object : java.io.OutputStream() {
+                override fun write(b: Int) { buffered.write(b); md?.update(b.toByte()); tr.sent.incrementAndGet() }
+                override fun write(b: ByteArray, off: Int, len: Int) { buffered.write(b, off, len); md?.update(b, off, len); tr.sent.addAndGet(len.toLong()) }
+                override fun flush() = buffered.flush()
+            }
+            if (encHdr == "aes-gcm-v2") {
+                Crypto.decryptStream(counting, input, key)
+            } else {
+                Crypto.decryptStreamV1(counting, input, key)
+            }
+            buffered.flush()
+        } else {
+            val buffered = java.io.BufferedOutputStream(rawOut, 256 * 1024)
+            val buf = ByteArray(256 * 1024)
+            var remaining = if (len >= 0) len else Long.MAX_VALUE
+            while (remaining > 0) {
+                val want = if (len >= 0) minOf(buf.size.toLong(), remaining).toInt() else buf.size
+                val n = input.read(buf, 0, want)
+                if (n < 0) break
+                buffered.write(buf, 0, n)
+                md?.update(buf, 0, n)
+                remaining -= n
+                tr.sent.addAndGet(n.toLong())
+            }
+            buffered.flush()
+        }
+    }
+
+    /** Delete stale MediaStore files whose DISPLAY_NAME matches the folder name,
+     *  left over from previous failed folder transfers. */
+    private fun cleanStaleEntries(cr: android.content.ContentResolver, folderName: String) {
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val sel = "${MediaStore.Downloads.RELATIVE_PATH} = ? AND ${MediaStore.Downloads.DISPLAY_NAME} = ?"
+        val args = arrayOf("${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop/", folderName)
+        val deleted = cr.delete(collection, sel, args)
+        if (deleted > 0) {
+            android.util.Log.i("SwiftDrop", "cleanStaleEntries: removed $deleted stale '$folderName' entries")
+        }
+    }
+
+    // ---- folder protocol: announce / file / done --------------------------
+
+    private fun handleFolderAnnounce(
+        session: IHTTPSession, folderName: String, from: String, fromID: String
+    ): Response {
+        val folderSize = session.headers["x-file-size"]?.toLongOrNull() ?: 0L
+        val folderCount = session.headers["x-folder-count"] ?: "?"
+
+        val displayName = "📁 $folderName"
+        val tr = State.newPendingTransfer(displayName, folderSize, from)
+        val sizeStr = humanSize(folderSize)
+
+        // Show consent dialog.
+        val activity = State.foregroundActivity
+        if (activity != null) {
+            activity.runOnUiThread {
+                showConsentDialog(activity, tr, from, "$folderName ($folderCount files)", sizeStr)
+            }
+        } else {
+            tr.consentNotifId = Notifier.showConsentNotification(State.appContext, tr.id, from, "$folderName ($folderCount files)", sizeStr)
+        }
+
+        val responded = tr.decision.await(60, java.util.concurrent.TimeUnit.SECONDS)
+        if (!responded || !tr.accepted) {
+            tr.status = "error"; tr.err = if (responded) "rejected by user" else "no response — auto-rejected"
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, tr.err)
+        }
+        tr.status = "sending"
+
+        // Generate session token.
+        val tokenBytes = ByteArray(16)
+        java.security.SecureRandom().nextBytes(tokenBytes)
+        val sessionToken = tokenBytes.joinToString("") { "%02x".format(it) }
+
+        folderSessions[sessionToken] = FolderSession(
+            folderName = folderName,
+            senderId = fromID,
+            transfer = tr
+        )
+
+        android.util.Log.i("SwiftDrop", "folder-announce '$folderName' from $from → session ${sessionToken.take(8)}")
+        return json("""{"session":"$sessionToken"}""")
+    }
+
+    private fun handleFolderFile(
+        session: IHTTPSession, sessionID: String, from: String, fromID: String
+    ): Response {
+        val fs = folderSessions[sessionID]
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "invalid/expired folder session")
+        if (fs.senderId != fromID) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "sender mismatch")
+        }
+
+        val relPath = session.headers["x-folder-rel"] ?: ""
+        if (relPath.isEmpty() || relPath.contains("..")) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "invalid relative path")
+        }
+
+        val cr = State.appContext.contentResolver
+        val encHdr = session.headers["x-encrypted"] ?: ""
+        val encrypted = encHdr == "aes-gcm-v2" || encHdr == "aes-gcm"
+        val len = session.headers["content-length"]?.toLongOrNull() ?: -1L
+
+        // Place file in MediaStore Downloads/SwiftDrop/<folderName>/<parent>
+        val fileName = relPath.substringAfterLast('/')
+        val parent = relPath.substringBeforeLast('/', "")
+        val basePath = "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop/${fs.folderName}"
+        val fullRelPath = if (parent.isNotEmpty()) "$basePath/$parent" else basePath
+
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+            put(MediaStore.Downloads.RELATIVE_PATH, fullRelPath)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val dest = cr.insert(collection, values)
+            ?: return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "MediaStore insert failed")
+
+        try {
+            cr.openOutputStream(dest).use { rawOut ->
+                requireNotNull(rawOut) { "cannot open output" }
+                writeBody(rawOut, session.inputStream, fs.transfer, null, len, encHdr, encrypted, fs.senderId)
+            }
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            cr.update(dest, values, null, null)
+            fs.filesReceived.incrementAndGet()
+            return json("""{"ok":true}""")
+        } catch (e: Exception) {
+            runCatching { cr.delete(dest, null, null) }
+            android.util.Log.e("SwiftDrop", "folder-file $relPath failed: ${e.message}", e)
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.message ?: "write failed")
+        }
+    }
+
+    private fun handleFolderDone(session: IHTTPSession, sessionID: String, from: String): Response {
+        val cancelled = session.headers["x-folder-cancelled"] == "true"
+        folderSessions.remove(sessionID)?.let { fs ->
+            val recv = fs.filesReceived.get()
+            val n = fs.transfer.sent.get()
+            if (cancelled) {
+                if (recv > 0) {
+                    fs.transfer.status = "done"
+                    fs.transfer.err = "cancelled by sender \u2013 $recv file(s) received"
+                    android.util.Log.i("SwiftDrop", "folder-cancelled '${fs.folderName}' from $from: $recv files, ${humanSize(n)}")
+                    Notifier.show(State.appContext, "Folder ${fs.folderName} partially received ($recv files) from $from")
+                } else {
+                    fs.transfer.status = "canceled"
+                    fs.transfer.err = "cancelled by sender"
+                    android.util.Log.i("SwiftDrop", "folder-cancelled '${fs.folderName}' from $from: 0 files received")
+                }
+            } else {
+                fs.transfer.status = "done"
+                android.util.Log.i("SwiftDrop", "folder-done '${fs.folderName}' from $from ($recv files, ${humanSize(n)})")
+                Notifier.show(State.appContext, "Received folder ${fs.folderName} ($recv files) from $from")
+            }
+        }
+        return json("""{"ok":true}""")
     }
 
     // ---- sending ---------------------------------------------------------
@@ -257,10 +495,28 @@ class HttpServer : NanoHTTPD(State.PORT) {
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "pair with this device first")
         }
 
-        val paths = obj.optJSONArray("paths") ?: JSONArray()
-        for (i in 0 until paths.length()) {
-            val uri = Uri.parse(paths.getString(i))
-            Thread { Sender.sendUri(peer, uri) }.start()
+        // New format: items=[{path, is_folder, name, size, file_count}]
+        val items = obj.optJSONArray("items")
+        if (items != null) {
+            for (i in 0 until items.length()) {
+                val item = items.getJSONObject(i)
+                val uri = Uri.parse(item.getString("path"))
+                if (item.optBoolean("is_folder", false)) {
+                    val name = item.optString("name", "Folder")
+                    val size = item.optLong("size", 0)
+                    val count = item.optInt("file_count", 0)
+                    Thread { Sender.sendFolder(peer, uri, name, size, count) }.start()
+                } else {
+                    Thread { Sender.sendUri(peer, uri) }.start()
+                }
+            }
+        } else {
+            // Legacy format: paths=["uri1", "uri2"]
+            val paths = obj.optJSONArray("paths") ?: JSONArray()
+            for (i in 0 until paths.length()) {
+                val uri = Uri.parse(paths.getString(i))
+                Thread { Sender.sendUri(peer, uri) }.start()
+            }
         }
         return json("""{"ok":true}""")
     }
@@ -424,6 +680,9 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val fromId = body.optString("fromId", "")
         if (text.isEmpty() || fromId.isEmpty())
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "bad request")
+        // Reject chat from unpaired senders to prevent spoofing.
+        if (PairStore.isPaired(fromId) == null)
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "not paired")
         State.chatStore.add(fromId, ChatMsg(text = text, from = from, dir = "recv"))
         State.chatNotifyPeer = fromId
         State.chatNotifyName = from
@@ -527,6 +786,11 @@ class HttpServer : NanoHTTPD(State.PORT) {
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found or not pending")
         tr.accepted = accept
         tr.decision.countDown()
+        // Dismiss the consent notification if one was shown.
+        if (tr.consentNotifId != 0) {
+            State.appContext.getSystemService(android.app.NotificationManager::class.java)
+                .cancel(tr.consentNotifId)
+        }
         return json("""{"ok":true}""")
     }
 
@@ -572,16 +836,17 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val peer = State.peer(deviceId)
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "unknown device")
 
-        // POST PIN to remote peer's /api/pair/claim
-        val payload = JSONObject().apply {
-            put("pin", pin); put("id", State.deviceId); put("name", State.deviceName)
+        // SPAKE2 PAKE: PIN never crosses the wire.
+        val spakeState = Spake2.clientStart(pin)
+        val pakePayload = JSONObject().apply {
+            put("pake_msg", bytesToHex(spakeState.msgA))
+            put("id", State.deviceId); put("name", State.deviceName)
         }.toString()
         val conn = (java.net.URL("http://${peer.host}/api/pair/claim").openConnection() as java.net.HttpURLConnection).apply {
             requestMethod = "POST"; connectTimeout = 5000; readTimeout = 5000
-            setRequestProperty("Content-Type", "application/json")
-            doOutput = true
+            setRequestProperty("Content-Type", "application/json"); doOutput = true
         }
-        conn.outputStream.use { it.write(payload.toByteArray()) }
+        conn.outputStream.use { it.write(pakePayload.toByteArray()) }
         if (conn.responseCode != 200) {
             val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "pairing rejected"
             conn.disconnect()
@@ -589,16 +854,38 @@ class HttpServer : NanoHTTPD(State.PORT) {
         }
         val result = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
         conn.disconnect()
-        val keyHex = result.optString("key")
-        val keyBytes = PairStore.run {
-            val b = ByteArray(keyHex.length / 2)
-            for (i in b.indices) b[i] = ((Character.digit(keyHex[2 * i], 16) shl 4) + Character.digit(keyHex[2 * i + 1], 16)).toByte()
-            b
+        val spakeKey = try {
+            spakeState.finish(hexToBytes(result.optString("pake_msg")), hexToBytes(result.optString("pake_confirm")))
+        } catch (_: Exception) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "wrong PIN")
         }
-        if (keyBytes.size != 32) {
-            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "invalid key")
+        val keyBytes = try {
+            Spake2.aesGcmUnwrap(spakeKey, hexToBytes(result.optString("encrypted_key")))
+        } catch (_: Exception) {
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "wrong PIN")
         }
+        if (keyBytes.size != 32)
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "invalid key length")
+
+        // Phase 2: send client confirmation so server knows the PIN was correct.
+        val clientConfirm = Spake2.confirmMac(spakeKey, "client")
+        val confirmPayload = JSONObject().apply {
+            put("id", State.deviceId); put("pake_confirm", bytesToHex(clientConfirm))
+        }.toString()
+        val confirmConn = (java.net.URL("http://${peer.host}/api/pair/pake-confirm").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"; connectTimeout = 5000; readTimeout = 5000
+            setRequestProperty("Content-Type", "application/json"); doOutput = true
+        }
+        confirmConn.outputStream.use { it.write(confirmPayload.toByteArray()) }
+        if (confirmConn.responseCode != 200) {
+            val err = confirmConn.errorStream?.bufferedReader()?.use { it.readText() } ?: "confirmation failed"
+            confirmConn.disconnect()
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, err)
+        }
+        confirmConn.disconnect()
+
         PairStore.storeKey(deviceId, keyBytes)
+        android.util.Log.i("SwiftDrop", "SPAKE2 paired with ${peer.name} ($deviceId)")
         return json("""{"ok":true}""")
     }
 
@@ -628,12 +915,29 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val body = HashMap<String, String>()
         session.parseBody(body)
         val obj = JSONObject(body["postData"] ?: "{}")
-        val token = obj.optString("token")
         val peerId = obj.optString("id")
-        val key = PairStore.claimQRToken(token, peerId)
-            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "invalid or expired token")
-        return json("""{"key":"${PairStore.bytesToHex(key)}"}"""
-        )
+        val peerName = obj.optString("name")
+        val pakeMsg = obj.optString("pake_msg")
+        if (pakeMsg.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "pake_msg required")
+        // Use the QR token as the SPAKE2 password (256-bit entropy).
+        val token = PairStore.qrToken
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending QR pairing")
+        if (System.currentTimeMillis() > PairStore.qrExpiry)
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "QR token expired")
+        val qrKey = PairStore.qrKey
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending QR key")
+        val clientMsg = try { hexToBytes(pakeMsg) } catch (_: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "invalid pake_msg")
+        }
+        val result = try { Spake2.serverFinish(token, clientMsg) } catch (e: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "SPAKE2 failed: ${e.message}")
+        }
+        val wrapped = Spake2.aesGcmWrap(result.sharedKey, qrKey)
+        // Hold — do NOT commit yet. Wait for client confirmation in Phase 2.
+        PairStore.holdPAKE(peerId, result.sharedKey, qrKey)
+        android.util.Log.i("SwiftDrop", "QR SPAKE2 exchange with $peerName ($peerId) — awaiting confirmation")
+        return json("""{"pake_msg":"${bytesToHex(result.msgB)}","pake_confirm":"${bytesToHex(result.confirm)}","encrypted_key":"${bytesToHex(wrapped)}"}""")
     }
 
     @Suppress("DEPRECATION")
@@ -745,10 +1049,148 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val body = HashMap<String, String>()
         session.parseBody(body)
         val obj = JSONObject(body["postData"] ?: "{}")
-        val pin = obj.optString("pin")
         val peerId = obj.optString("id")
-        val key = PairStore.claimPIN(pin, peerId)
-            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "invalid or expired PIN")
-        return json("""{"key":"${PairStore.bytesToHex(key)}"}""")
+        val peerName = obj.optString("name")
+        val pakeMsg = obj.optString("pake_msg")
+        if (pakeMsg.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "pake_msg required")
+        val pin = PairStore.pendingPIN
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending pairing")
+        if (System.currentTimeMillis() > PairStore.pendingExpiry)
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "pairing expired")
+        val clientMsg = try { hexToBytes(pakeMsg) } catch (_: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "invalid pake_msg")
+        }
+        val result = try { Spake2.serverFinish(pin, clientMsg) } catch (e: Exception) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "SPAKE2 failed: ${e.message}")
+        }
+        val pairKey = PairStore.pendingKey
+            ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "no pending key")
+        val wrapped = Spake2.aesGcmWrap(result.sharedKey, pairKey)
+        // Hold — do NOT commit yet. Wait for client confirmation in Phase 2.
+        PairStore.holdPAKE(peerId, result.sharedKey, pairKey)
+        android.util.Log.i("SwiftDrop", "SPAKE2 exchange with $peerName ($peerId) — awaiting confirmation")
+        return json("""{"pake_msg":"${bytesToHex(result.msgB)}","pake_confirm":"${bytesToHex(result.confirm)}","encrypted_key":"${bytesToHex(wrapped)}"}""")
+    }
+
+    private fun handlePAKEConfirm(session: IHTTPSession): Response {
+        val body = HashMap<String, String>()
+        session.parseBody(body)
+        val obj = JSONObject(body["postData"] ?: "{}")
+        val peerId = obj.optString("id")
+        val confirm = obj.optString("pake_confirm")
+        if (confirm.isEmpty())
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "pake_confirm required")
+        if (!PairStore.confirmPAKE(peerId, hexToBytes(confirm)))
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "wrong PIN or expired")
+        android.util.Log.i("SwiftDrop", "SPAKE2 pairing confirmed for $peerId")
+        return json("""{"ok":true}""")
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val len = hex.length
+        val data = ByteArray(len / 2)
+        for (i in 0 until len step 2) data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
+        return data
+    }
+
+    private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
+
+    private fun handleRemoteUnpair(session: IHTTPSession): Response {
+        val id = session.parameters["id"]?.firstOrNull() ?: ""
+        if (id.isNotEmpty()) {
+            // Verify the caller's IP matches the registered peer to prevent spoofing.
+            val callerIp = normalizeIp(session.remoteIpAddress ?: "")
+            val peer = State.peer(id)
+            if (peer != null) {
+                val peerIp = normalizeIp(peer.host.substringBeforeLast(":"))
+                if (callerIp != peerIp) {
+                    return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "forbidden")
+                }
+            }
+            PairStore.unpair(id)
+        }
+        return json("""{"ok":true}""")
+    }
+
+    /** Strip ::ffff: prefix from IPv6-mapped IPv4 so comparisons work. */
+    private fun normalizeIp(ip: String): String {
+        val stripped = ip.removePrefix("::ffff:")
+        return try {
+            val addr = java.net.InetAddress.getByName(stripped)
+            if (addr is java.net.Inet4Address) addr.hostAddress ?: stripped else stripped
+        } catch (_: Exception) { stripped }
+    }
+
+    /** Unzips a local temp file into MediaStore under Downloads/SwiftDrop/.
+     *  The zip entries already include the folder name (e.g. "test/file1.txt"),
+     *  so we use Downloads/SwiftDrop as the base — no extra nesting needed. */
+    private fun unzipFromFile(cr: android.content.ContentResolver, zipFile: java.io.File, folderName: String) {
+        val basePath = "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop"
+        android.util.Log.i("SwiftDrop", "unzipFromFile: file=${zipFile.length()} bytes folderName=$folderName")
+        java.io.FileInputStream(zipFile).use { fis ->
+            val zis = java.util.zip.ZipInputStream(fis)
+            var entry = zis.nextEntry
+            var count = 0
+            while (entry != null) {
+                val entryName = entry.name
+                // Zip-slip guard: reject paths that try to escape.
+                if (entryName.contains("..")) { zis.closeEntry(); entry = zis.nextEntry; continue }
+                if (!entry.isDirectory) {
+                    val parent = entryName.substringBeforeLast('/', "")
+                    val fileName = entryName.substringAfterLast('/')
+                    if (fileName.isNotEmpty()) {
+                        val fullRelPath = if (parent.isNotEmpty()) "$basePath/$parent" else basePath
+                        val values = ContentValues().apply {
+                            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                            put(MediaStore.Downloads.RELATIVE_PATH, fullRelPath)
+                            put(MediaStore.Downloads.IS_PENDING, 1)
+                        }
+                        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        val entryUri = cr.insert(collection, values)
+                        if (entryUri != null) {
+                            cr.openOutputStream(entryUri)?.use { out ->
+                                val buf = ByteArray(256 * 1024)
+                                while (true) {
+                                    val n = zis.read(buf)
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                }
+                            }
+                            values.clear()
+                            values.put(MediaStore.Downloads.IS_PENDING, 0)
+                            cr.update(entryUri, values, null, null)
+                            count++
+                        }
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+            zis.close()
+            android.util.Log.i("SwiftDrop", "unzip $folderName: extracted $count files")
+        }
+    }
+}
+
+/** Prevents HMAC replay attacks by remembering recent auth signatures. */
+class ReplayCache {
+    private val seen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    init {
+        // Background cleanup every 60 s.
+        val timer = java.util.Timer("ReplayCacheCleanup", true)
+        timer.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                val now = System.currentTimeMillis()
+                seen.entries.removeAll { it.value < now }
+            }
+        }, 60_000L, 60_000L)
+    }
+
+    /** Returns true if this HMAC has not been seen (first use). False on replay. */
+    fun check(hmacHex: String): Boolean {
+        val expiry = System.currentTimeMillis() + 6 * 60 * 1000 // 5 min window + 1 min buffer
+        return seen.putIfAbsent(hmacHex, expiry) == null
     }
 }

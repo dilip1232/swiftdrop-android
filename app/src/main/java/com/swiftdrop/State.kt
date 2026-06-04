@@ -31,6 +31,7 @@ class Transfer(val id: String, val name: String, val size: Long, val peer: Strin
     // Receiver consent: latch blocks handleInbox until user responds.
     val decision = CountDownLatch(1)
     @Volatile var accepted: Boolean = false
+    @Volatile var consentNotifId: Int = 0 // notification ID to dismiss on web-UI accept/reject
     // Pause support: CountingStream blocks reads while paused.
     private val pauseLock = java.util.concurrent.locks.ReentrantLock()
     private val resumeCond = pauseLock.newCondition()
