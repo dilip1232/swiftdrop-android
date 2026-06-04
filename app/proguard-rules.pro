@@ -6,3 +6,7 @@
 -keep class fi.iki.elonen.** { *; }
 # ZXing QR code generation
 -keep class com.google.zxing.** { *; }
+# Google Tink — suppress missing compile-only annotation classes
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn javax.annotation.**
+-dontwarn javax.annotation.concurrent.**
