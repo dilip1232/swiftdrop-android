@@ -922,45 +922,52 @@ class HttpServer : NanoHTTPD(State.PORT) {
         } catch (_: Exception) { stripped }
     }
 
-    /** Unzips a MediaStore zip entry into individual files under Downloads/SwiftDrop/[folderName]/. */
+    /** Unzips a MediaStore zip entry into individual files under Downloads/SwiftDrop/.
+     *  The zip entries already include the folder name (e.g. "test/file1.txt"),
+     *  so we use Downloads/SwiftDrop as the base — no extra nesting needed. */
     private fun unzipMediaStore(cr: android.content.ContentResolver, zipUri: Uri, folderName: String) {
+        val basePath = "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop"
         cr.openInputStream(zipUri)?.use { input ->
             val zis = java.util.zip.ZipInputStream(input)
             var entry = zis.nextEntry
+            var count = 0
             while (entry != null) {
                 val entryName = entry.name
                 // Zip-slip guard: reject paths that try to escape.
                 if (entryName.contains("..")) { zis.closeEntry(); entry = zis.nextEntry; continue }
                 if (!entry.isDirectory) {
-                    val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop/$folderName"
                     val parent = entryName.substringBeforeLast('/', "")
                     val fileName = entryName.substringAfterLast('/')
-                    val fullRelPath = if (parent.isNotEmpty()) "$relativePath/$parent" else relativePath
-                    val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                        put(MediaStore.Downloads.RELATIVE_PATH, fullRelPath)
-                        put(MediaStore.Downloads.IS_PENDING, 1)
-                    }
-                    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                    val entryUri = cr.insert(collection, values)
-                    if (entryUri != null) {
-                        cr.openOutputStream(entryUri)?.use { out ->
-                            val buf = ByteArray(256 * 1024)
-                            while (true) {
-                                val n = zis.read(buf)
-                                if (n < 0) break
-                                out.write(buf, 0, n)
-                            }
+                    if (fileName.isNotEmpty()) {
+                        val fullRelPath = if (parent.isNotEmpty()) "$basePath/$parent" else basePath
+                        val values = ContentValues().apply {
+                            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                            put(MediaStore.Downloads.RELATIVE_PATH, fullRelPath)
+                            put(MediaStore.Downloads.IS_PENDING, 1)
                         }
-                        values.clear()
-                        values.put(MediaStore.Downloads.IS_PENDING, 0)
-                        cr.update(entryUri, values, null, null)
+                        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        val entryUri = cr.insert(collection, values)
+                        if (entryUri != null) {
+                            cr.openOutputStream(entryUri)?.use { out ->
+                                val buf = ByteArray(256 * 1024)
+                                while (true) {
+                                    val n = zis.read(buf)
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                }
+                            }
+                            values.clear()
+                            values.put(MediaStore.Downloads.IS_PENDING, 0)
+                            cr.update(entryUri, values, null, null)
+                            count++
+                        }
                     }
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry
             }
             zis.close()
+            android.util.Log.i("SwiftDrop", "unzip $folderName: extracted $count files")
         } ?: throw IllegalStateException("cannot open zip for extraction")
     }
 }
