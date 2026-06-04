@@ -255,8 +255,23 @@ class HttpServer : NanoHTTPD(State.PORT) {
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             cr.update(dest, values, null, null)
-            tr.status = "done"
-            Notifier.show(State.appContext, "Received $name")
+
+            // Auto-unzip folder transfers.
+            val isFolder = session.headers["x-folder"] == "zip"
+            if (isFolder) {
+                try {
+                    unzipMediaStore(cr, dest, name.substringBeforeLast(".").ifEmpty { name })
+                    cr.delete(dest, null, null) // clean up temp zip
+                } catch (e: Exception) {
+                    tr.status = "error"; tr.err = "unzip: ${e.message}"
+                    return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "unzip failed: ${e.message}")
+                }
+                tr.status = "done"
+                Notifier.show(State.appContext, "Received folder $name")
+            } else {
+                tr.status = "done"
+                Notifier.show(State.appContext, "Received $name")
+            }
             return json("""{"ok":true}""")
         } catch (e: Exception) {
             tr.status = "error"; tr.err = e.message
@@ -883,6 +898,48 @@ class HttpServer : NanoHTTPD(State.PORT) {
             val addr = java.net.InetAddress.getByName(stripped)
             if (addr is java.net.Inet4Address) addr.hostAddress ?: stripped else stripped
         } catch (_: Exception) { stripped }
+    }
+
+    /** Unzips a MediaStore zip entry into individual files under Downloads/SwiftDrop/[folderName]/. */
+    private fun unzipMediaStore(cr: android.content.ContentResolver, zipUri: Uri, folderName: String) {
+        cr.openInputStream(zipUri)?.use { input ->
+            val zis = java.util.zip.ZipInputStream(input)
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val entryName = entry.name
+                // Zip-slip guard: reject paths that try to escape.
+                if (entryName.contains("..")) { zis.closeEntry(); entry = zis.nextEntry; continue }
+                if (!entry.isDirectory) {
+                    val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/SwiftDrop/$folderName"
+                    val parent = entryName.substringBeforeLast('/', "")
+                    val fileName = entryName.substringAfterLast('/')
+                    val fullRelPath = if (parent.isNotEmpty()) "$relativePath/$parent" else relativePath
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                        put(MediaStore.Downloads.RELATIVE_PATH, fullRelPath)
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                    val entryUri = cr.insert(collection, values)
+                    if (entryUri != null) {
+                        cr.openOutputStream(entryUri)?.use { out ->
+                            val buf = ByteArray(256 * 1024)
+                            while (true) {
+                                val n = zis.read(buf)
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                            }
+                        }
+                        values.clear()
+                        values.put(MediaStore.Downloads.IS_PENDING, 0)
+                        cr.update(entryUri, values, null, null)
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+            zis.close()
+        } ?: throw IllegalStateException("cannot open zip for extraction")
     }
 }
 
