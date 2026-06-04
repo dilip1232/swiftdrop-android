@@ -194,10 +194,11 @@ object Sender {
             }
             t.conn = conn
 
+            // Progress is tracked by raw bytes read in zipTreeChildren,
+            // not by zip/encrypted output bytes, so it matches totalSize.
             if (encrypted) {
-                val counting = CountingInputStream(pipedIn, t)
                 val bufferedOut = BufferedOutputStream(conn.outputStream, BUF)
-                Crypto.encryptStream(bufferedOut, counting, key!!)
+                Crypto.encryptStream(bufferedOut, pipedIn, key!!)
                 bufferedOut.flush()
             } else {
                 BufferedOutputStream(conn.outputStream, BUF).use { out ->
@@ -207,7 +208,6 @@ object Sender {
                         val n = pipedIn.read(buf)
                         if (n < 0) break
                         out.write(buf, 0, n)
-                        t.sent.addAndGet(n.toLong())
                     }
                     out.flush()
                 }
@@ -267,6 +267,7 @@ object Sender {
                             val n = input.read(buf)
                             if (n < 0) break
                             zos.write(buf, 0, n)
+                            t.sent.addAndGet(n.toLong())
                         }
                     }
                     zos.closeEntry()

@@ -297,6 +297,76 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Dark-themed bottom sheet picker matching the app's design language. */
+    private fun showPickerSheet() {
+        val dialog = android.app.Dialog(this)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        val dp = resources.displayMetrics.density
+
+        val root = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(0xFF1A1D23.toInt())
+            setPadding((20 * dp).toInt(), (20 * dp).toInt(), (20 * dp).toInt(), (24 * dp).toInt())
+        }
+
+        // Title
+        root.addView(android.widget.TextView(this).apply {
+            text = "Choose what to send"
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 17f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, (16 * dp).toInt())
+        })
+
+        fun optionRow(icon: String, label: String, sub: String, onClick: () -> Unit) {
+            val row = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding((12 * dp).toInt(), (14 * dp).toInt(), (12 * dp).toInt(), (14 * dp).toInt())
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(0xFF23262E.toInt())
+                    cornerRadius = 12 * dp
+                }
+                val lp = android.widget.LinearLayout.LayoutParams(-1, -2)
+                lp.bottomMargin = (10 * dp).toInt()
+                layoutParams = lp
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { dialog.dismiss(); onClick() }
+            }
+            row.addView(android.widget.TextView(this).apply {
+                text = icon; textSize = 26f
+                setPadding(0, 0, (14 * dp).toInt(), 0)
+            })
+            val col = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+            }
+            col.addView(android.widget.TextView(this).apply {
+                text = label; setTextColor(0xFFFFFFFF.toInt()); textSize = 15f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            })
+            col.addView(android.widget.TextView(this).apply {
+                text = sub; setTextColor(0xFF8A8F98.toInt()); textSize = 12f
+            })
+            row.addView(col)
+            root.addView(row)
+        }
+
+        optionRow("📄", "Files", "Pick one or more files") { pickFiles.launch(arrayOf("*/*")) }
+        optionRow("📁", "Folder", "Pick an entire folder") { pickFolder.launch(null) }
+
+        dialog.setContentView(root)
+        dialog.window?.apply {
+            setLayout(-1, -2) // MATCH_PARENT width, WRAP_CONTENT height
+            setGravity(android.view.Gravity.BOTTOM)
+            setBackgroundDrawableResource(android.R.color.transparent)
+            attributes = attributes.also {
+                it.windowAnimations = android.R.style.Animation_InputMethod
+            }
+        }
+        dialog.show()
+    }
+
     inner class Bridge {
         @JavascriptInterface
         fun pickFiles() {
@@ -310,18 +380,7 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun showPicker() {
-            runOnUiThread {
-                val items = arrayOf("Files", "Folder")
-                android.app.AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Choose what to send")
-                    .setItems(items) { _, which ->
-                        when (which) {
-                            0 -> pickFiles.launch(arrayOf("*/*"))
-                            1 -> pickFolder.launch(null)
-                        }
-                    }
-                    .show()
-            }
+            runOnUiThread { showPickerSheet() }
         }
 
         @JavascriptInterface
