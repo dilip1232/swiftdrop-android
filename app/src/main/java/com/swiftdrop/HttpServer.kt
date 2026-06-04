@@ -24,6 +24,8 @@ import java.io.ByteArrayOutputStream
  */
 class HttpServer : NanoHTTPD(State.PORT) {
 
+    private val replayCache = ReplayCache()
+
     override fun serve(session: IHTTPSession): Response = try {
         val uri = session.uri
         when {
@@ -74,8 +76,8 @@ class HttpServer : NanoHTTPD(State.PORT) {
             // QR-based pairing
             uri == "/api/pair/qr-begin" -> withToken(session) { handleQRBegin() }
             uri == "/api/pair/qr-claim" && session.method == Method.POST -> handleQRClaim(session)
-            uri == "/" || uri == "/index.html" -> asset("web/index.html", "text/html")
-            else -> asset("web$uri", mimeFor(uri))
+            uri == "/" || uri == "/index.html" -> localOnly(session) { asset("web/index.html", "text/html") }
+            else -> localOnly(session) { asset("web$uri", mimeFor(uri)) }
         }
     } catch (e: Exception) {
         newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.message ?: "error")
@@ -89,7 +91,17 @@ class HttpServer : NanoHTTPD(State.PORT) {
         return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, State.apiToken)
     }
 
+    private fun localOnly(session: IHTTPSession, block: () -> Response): Response {
+        val ip = session.remoteIpAddress ?: ""
+        if (ip.isNotEmpty() && ip != "127.0.0.1" && ip != "::1" && ip != "0:0:0:0:0:0:0:1")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "forbidden")
+        return block()
+    }
+
     private fun withToken(session: IHTTPSession, block: () -> Response): Response {
+        val ip = session.remoteIpAddress ?: ""
+        if (ip.isNotEmpty() && ip != "127.0.0.1" && ip != "::1" && ip != "0:0:0:0:0:0:0:1")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "forbidden")
         val tok = session.headers["x-api-token"] ?: ""
         if (tok != State.apiToken) {
             return newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "unauthorized")
@@ -127,6 +139,11 @@ class HttpServer : NanoHTTPD(State.PORT) {
         val expected = mac.doFinal("$fromID|$name|$authTime".toByteArray()).joinToString("") { "%02x".format(it) }
         if (authHMAC != expected) {
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "authentication failed")
+        }
+        // Reject replayed HMAC values.
+        if (!replayCache.check(authHMAC)) {
+            android.util.Log.w("SwiftDrop", "inbox HMAC replay detected from $fromID")
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "replay detected")
         }
 
         // Check free disk space using original file size (require positive size).
@@ -849,5 +866,27 @@ class HttpServer : NanoHTTPD(State.PORT) {
             val addr = java.net.InetAddress.getByName(stripped)
             if (addr is java.net.Inet4Address) addr.hostAddress ?: stripped else stripped
         } catch (_: Exception) { stripped }
+    }
+}
+
+/** Prevents HMAC replay attacks by remembering recent auth signatures. */
+class ReplayCache {
+    private val seen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    init {
+        // Background cleanup every 60 s.
+        val timer = java.util.Timer("ReplayCacheCleanup", true)
+        timer.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                val now = System.currentTimeMillis()
+                seen.entries.removeAll { it.value < now }
+            }
+        }, 60_000L, 60_000L)
+    }
+
+    /** Returns true if this HMAC has not been seen (first use). False on replay. */
+    fun check(hmacHex: String): Boolean {
+        val expiry = System.currentTimeMillis() + 6 * 60 * 1000 // 5 min window + 1 min buffer
+        return seen.putIfAbsent(hmacHex, expiry) == null
     }
 }
